@@ -1,0 +1,81 @@
+---
+title: "Double counting"
+author: "Kelly Hondula"
+date: "6/10/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Water cells in multiple polygons in each image. Filter cell IDs to mvdeps and water, then group by cell ID
+
+```{r}
+rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels")
+
+calc_double_count_percentage <- function(rf_predicts_file){
+  
+rf_predicts <- rf_predicts_file %>% vroom::vroom(col_types = c("iddddddddddddlllcddcc")) %>%
+  dplyr::select(cellindex, water_training, mvdeps, imgID, x, y, ID_sp, ranger_predict)
+
+rf_predicts_dc <- rf_predicts %>% 
+  filter(mvdeps, ranger_predict == 'water') %>% 
+  group_by(cellindex) %>%
+  summarise(n_polygons = n()) %>% 
+  arrange(desc(n_polygons)) %>% filter(n_polygons > 1)
+
+water_pix <- rf_predicts %>% filter(mvdeps, ranger_predict == 'water') %>% nrow()
+water_pix_dc <- rf_predicts_dc %>% nrow()
+
+percentage_dc <- water_pix_dc/water_pix
+
+# actually should calculate both the absoluate number (area) and percentage
+return(list("water_pix" = water_pix,
+            "water_pix_dc" = water_pix_dc, 
+            "dc_percentage" = percentage_dc))
+}
+
+calc_double_count_percentage('/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels/rfpredict_20180708_151405_104e.csv')
+
+dc_percentages <- purrr::map(rf_predicts_files, ~calc_double_count_percentage(.x))
+
+dc_percentages_df <- data.table::rbindlist(dc_percentages, fill = TRUE, idcol = TRUE) %>%
+  as.data.frame()
+
+dc_percentages_df %>% 
+  mutate(imgID = substr(basename(.id), 11, 30)) %>%
+  mutate(imgDate = as.Date(substr(imgID, 1, 8), "%Y%m%d")) %>%
+  dplyr::select(-.id) %>%
+  ggplot(aes(x = imgDate, y = dc_percentage)) +
+  geom_point() + theme_bw()
+
+dc_percentages_df %>% 
+  mutate(imgID = substr(basename(.id), 11, 30)) %>%
+  mutate(imgDate = as.Date(substr(imgID, 1, 8), "%Y%m%d")) %>%
+  dplyr::select(-.id) %>%
+  ggplot(aes(x = imgDate, y = water_pix_dc)) +
+  geom_point() + theme_bw()
+
+dc_percentages %>% as.data.frame() %>% tibble::rownames_to_column() %>%
+  # pull(.) %>% summary()
+  ggplot(aes(x = .)) + geom_histogram(binwidth = .01)
+  View()
+# rf_predicts_dc %>% left_join(rf_predicts) %>% pull(ID_sp) %>% unique() %>% length()
+# rf_predicts_dc
+dc_percentages_df$dc_percentage %>% summary()
+dc_percentages_df$water_pix_dc %>% summary()*9/1e6
+```
+
+```{r}
+rf_predicts_dc$n_polygons %>% table()
+```
+
+Area associated with the polygons that are removed from analysis (approx 300 polygons)
+
+```{r}
+mydep_ids <- substr(list.files(file.path(data_dir, "results", "ch4_flux_predicts")), 8, 12)
+mvdeps_buffered_areas %>%
+  filter(!dep_id %in% mydep_ids) %>% summarise(sum_area_excluded = sum(area_m2)/1e6)
+```
+
