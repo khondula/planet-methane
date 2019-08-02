@@ -24,68 +24,63 @@ library(readr)
 library(dplyr)
 ```
 
-
 # Apply UDM
 
-Unusable data mask from Planet described [here](https://github.com/planetlabs/notebooks/blob/master/jupyter-notebooks/udm/udm.ipynb)
-
-Most conservative - only keep pixels where the value of the UDM is 0, i.e. there are no flags. 
-
-UDMs are saved in `metadata/download_udm/
+* The Unusable data mask from Planet described [here](https://github.com/planetlabs/notebooks/blob/master/jupyter-notebooks/udm/udm.ipynb)
+* Most conservative - only keep pixels where the value of the UDM is 0, i.e. there are no flags. 
+* UDMs are saved in `metadata/download_udm/
 
 ```{r check_udms}
-myimg_ids <- substr(list.files("/nfs/khondula-data/planetmethane/data/"), 1, 20)
+myimg_ids <- substr(list.files("data/data/"), 1, 20) # 20 character image IDs
 message(paste(length(myimg_ids), "downloaded SR images"))
-all_udms <- substr(list.files("/nfs/khondula-data/planetmethane/metadata/download_udm"), 1, 20)
-message(paste(length(all_udms), "UDMs"))
-any(!myimg_ids %in% all_udms)
+my_udms <- substr(list.files("data/metadata/download_udm"), 1, 20)
+message(paste(length(my_udms), "UDMs"))
+message(paste(sum(!myimg_ids %in% my_udms), "images without UDMs"))
 ```
 
 Mask the image to set all values as NA that are not 0 in the unusable data mask
 
 First make a vector of the images that are in data/ but not in udm_masked_imgs
 
-```{r}
-myimg_ids <- substr(list.files("/nfs/khondula-data/planetmethane/data/"), 1, 20)
-all_masked_imgs <- substr(list.files("/nfs/khondula-data/planetmethane/udm_masked_imgs", 
-                                    pattern = ".grd"), 1, 20)
-message(paste(length(all_masked_imgs), "udm applied"))
+```{r ids_to_mask}
+all_masked_imgs <- substr(list.files("data/udm_masked_imgs", pattern = ".grd"), 1, 20)
+message(paste(length(all_masked_imgs), "udm masked images"))
 imgIDs_to_mask <- myimg_ids[!myimg_ids %in% all_masked_imgs]
 message(paste(length(imgIDs_to_mask), "udm not applied"))
 message("Not masked: ", paste(imgIDs_to_mask, collapse = ", "))
-my_udms <- substr(list.files("/nfs/khondula-data/planetmethane/metadata/download_udm"), 1, 20)
 imgIDs_to_mask_w_udms <- imgIDs_to_mask[imgIDs_to_mask %in% my_udms]
-imgIDs_to_mask_w_udms
 message(paste(length(imgIDs_to_mask_w_udms), "have udm but not applied"))
-
+imgIDs_to_mask_w_udms
 ```
 
 Apply UDM mask to vector you just created - IDs with UDMs that arent in udm_masked_imgs folder:
 
-```{r, eval=FALSE}
+```{r udm_func_defn, eval=FALSE}
 # imgID <- imgIDs_to_mask_w_udms[1]
-# for(imgID in imgIDs_to_mask_w_udms){
-  imgID <- imgIDs_to_mask_w_udms[1]
+
 apply_udm_mask <- function(imgID){
-myimg <- stack(grep(imgID, 
+  myimg <- stack(grep(imgID, 
                    list.files("/nfs/khondula-data/planetmethane/data/", 
                               full.names = TRUE), value = TRUE))
-myimg_udm <- raster(grep(imgID, 
+  myimg_udm <- raster(grep(imgID, 
                    list.files("/nfs/khondula-data/planetmethane/metadata/download_udm", 
                               full.names = TRUE), value = TRUE))
 
-masked_filename = paste0("/nfs/khondula-data/planetmethane/udm_masked_imgs/", imgID, ".grd")
-masked_stack <- mask(myimg, myimg_udm, inverse = TRUE, maskvalue = 0, updatevalue = NA,
+  masked_filename = paste0("/nfs/khondula-data/planetmethane/udm_masked_imgs/", imgID, ".grd")
+  masked_stack <- mask(myimg, myimg_udm, inverse = TRUE, maskvalue = 0, updatevalue = NA,
                      filename = masked_filename, overwrite = TRUE)  
 }
 
 ```
 
+Run function locally 
+
 ```{r}
-apply_udm_mask(imgID = imgIDs_to_mask_w_udms[2])
-purrr::walk(imgIDs_to_mask_w_udms[1:5], ~apply_udm_mask(.x))
+apply_udm_mask(imgID = imgIDs_to_mask_w_udms[1])
+# purrr::walk(imgIDs_to_mask_w_udms[], ~apply_udm_mask(.x))
 ```
-On the cluster
+
+Run function On the cluster
 
 ```{r}
 library(rslurm)
@@ -104,12 +99,14 @@ print_job_status(sjob)
 
 # Add Bands
 
+First figure out which images will be used for analysis and need the additional bands added
+
 ```{r}
-masked_imgfiles <- fs::dir_ls("/nfs/khondula-data/planetmethane/udm_masked_imgs/", glob = "*.grd")
+masked_imgfiles <- fs::dir_ls("data/udm_masked_imgs/", glob = "*.grd")
 masked_ids <- substr(basename(masked_imgfiles), 1, 20)
 message(paste(length(masked_ids), "udm masked images"))
 
-addbands_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/imgs_for_analysis")
+addbands_files <- fs::dir_ls("data/imgs_for_analysis")
 addbands_ids <- substr(basename(addbands_files), 1, 20)
 message(paste(length(addbands_ids), "images for analysis with bands added"))
 
@@ -123,11 +120,16 @@ message(paste(length(needbands_ids), "udm masked images without bands added"))
 ```
 
 ```{r}
-img_metadata_df <- readr::read_csv("/nfs/khondula-data/planetmethane/img_metadata_df.csv")
-imgs_addbands <- img_metadata_df %>% filter(cloud_cover >=0.01 & cloud_cover < 0.1) %>% arrange(desc(cloud_cover)) %>% pull(imgID)
+img_metadata_df <- readr::read_csv("data/img_metadata_df.csv")
+imgs_addbands <- img_metadata_df %>% 
+  filter(cloud_cover >=0.01 & cloud_cover < 0.1) %>% 
+  arrange(desc(cloud_cover)) %>% 
+  pull(imgID)
 
 imgs_metadata_issues <- img_metadata_df %>%
-  dplyr::filter(quality_category == "test" | cloud_cover > 0.1 | visible_clouds) %>% pull(imgID)
+  dplyr::filter(quality_category == "test" | cloud_cover > 0.1 | visible_clouds) %>% 
+  pull(imgID)
+
 needbands_files <- needbands_files[!needbands_ids %in% imgs_metadata_issues]
 needbands_ids <- substr(basename(needbands_files), 1, 20)
 needbands_ids
@@ -136,7 +138,8 @@ message(paste(length(masked_layer_ids), "masked images without bands added and w
 
 ```
 
-```{r}
+
+```{r addbands_func_defn}
 masked_imgfile <- needbands_files[1]
 masked_imgfile <- masked_imgfiles[1]
 
@@ -234,29 +237,18 @@ sjob4 <- rslurm::slurm_apply(save_allbands, pars,
                             submit = TRUE)
 
 print_job_status(sjob4)
-length(list.files("/nfs/khondula-data/planetmethane/imgs_for_analysis"))
+
 ```
 
+
 ```{r}
+length(list.files("data/imgs_for_analysis"))
 band_names <- c("b1_blue", "b2_green", "b3_red", "b4_NIR",
                 "NDVI", "NDWI", "HUE", "SAT", "VAL", "LUM", "CHROMA", "HUE2")
-r_stack_in <- raster::stack("/nfs/khondula-data/planetmethane/imgs_for_analysis/20171004_155646_103f.tif")
+r_stack_in <- raster::stack("data/imgs_for_analysis/20171004_155646_103f.tif")
 names(r_stack_in) <- band_names
 # tabularaster::as_tibble(r_stack_in) %>%
 #   dplyr::filter(!is.na(cellvalue)) %>%
 #   head()
-rasterVis::levelplot(r_stack_in$NDVI)
-range(getValues(r_stack_in$b1_blue), na.rm = TRUE)
-range(getValues(r_stack_in$b2_green), na.rm = TRUE)
-range(getValues(r_stack_in$b3_red), na.rm = TRUE)
-range(getValues(r_stack_in$b4_NIR), na.rm = TRUE)
-```
-
-```{r}
-masked_layers <- fs::dir_ls("/nfs/khondula-data/planetmethane/udm_masked_allbands") %>%
-  sapply(function(x) nlayers(stack(x)))
-names(which(masked_layers != 12)) %>% basename() %>% substr(1,20)
-
-test <- raster::stack(fs::dir_ls("/nfs/khondula-data/planetmethane/udm_masked_allbands")[3])
 ```
 
