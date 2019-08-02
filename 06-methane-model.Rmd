@@ -1,0 +1,883 @@
+---
+title: "methane model"
+author: "Kelly Hondula"
+date: "6/1/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(vroom)
+```
+
+```{r}
+# lo95_ts_join_rank %>% write_csv("water_area_loess_predictions.csv")
+# mov_avg_ts %>% write_csv("water_area_mov_avg_predictions.csv")
+```
+
+```{r}
+mvdeps_buffered_areas <- mvdeps_buffered_areas %>%
+  mutate(log_area = log(ha))
+```
+
+# Holgerson area model
+
+Log-log relationship reported in Holgreson and Raymond 2016 area is log area (ha)
+
+```{r}
+holg <- read_csv("data/holgerson-data.csv") %>%
+  mutate(log_ch4 = log(ch4), log_area = log(area))
+```
+
+```{r}
+lm1 <- lm(log_ch4 ~ log_area, data = holg)
+summary(lm1)
+```
+
+```{r}
+mvdeps_size_cats # this has all of the different areas
+
+mvdeps_size_cats_forCH4 <- mvdeps_size_cats %>% 
+  dplyr::select(dep_id, ha, max_waterpred_m2, mean_waterpred_m2, inTI) %>%
+  mutate(log_max_area_ha = log(max_waterpred_m2/10000),
+         log_area_ha = log(ha),
+         log_mean_area_ha = log(mean_waterpred_m2/10000)) %>%
+  filter(inTI)
+
+lm1_predicts_max_area <- predict(lm1, 
+                       newdata = mutate(mvdeps_size_cats_forCH4, 
+                                        log_area = log_max_area_ha),
+                       interval = "confidence")
+lm1_predicts_mean_area <- predict(lm1, 
+                       newdata = mutate(mvdeps_size_cats_forCH4, 
+                                        log_area = log_mean_area_ha),
+                       interval = "confidence")
+lm1_predicts_mvdeps_area <- predict(lm1, 
+                       newdata = mutate(mvdeps_size_cats_forCH4, 
+                                        log_area = log_area_ha),
+                       interval = "confidence")
+
+max_area_ch4_ests <- mvdeps_size_cats_forCH4 %>%
+  dplyr::select(dep_id) %>%
+  mutate(est_fit = exp(lm1_predicts_max_area[,1]),
+         est_lwr = exp(lm1_predicts_max_area[,2]),
+         est_upr = exp(lm1_predicts_max_area[,3])) %>%
+  tidyr::gather(est_type, ch4_umol, est_fit:est_upr) %>%
+  mutate(area_type = "max_area")
+
+mean_area_ch4_ests <- mvdeps_size_cats_forCH4 %>%
+  dplyr::select(dep_id) %>%
+  mutate(est_fit = exp(lm1_predicts_mean_area[,1]),
+         est_lwr = exp(lm1_predicts_mean_area[,2]),
+         est_upr = exp(lm1_predicts_mean_area[,3])) %>%
+  tidyr::gather(est_type, ch4_umol, est_fit:est_upr) %>%
+  mutate(area_type = "mean_area")
+
+mvdeps_area_ch4_ests <- mvdeps_size_cats_forCH4 %>%
+  dplyr::select(dep_id) %>%
+  mutate(est_fit = exp(lm1_predicts_mvdeps_area[,1]),
+         est_lwr = exp(lm1_predicts_mvdeps_area[,2]),
+         est_upr = exp(lm1_predicts_mvdeps_area[,3])) %>%
+  tidyr::gather(est_type, ch4_umol, est_fit:est_upr) %>%
+  mutate(area_type = "mvdeps_area")
+
+ch4_umol_predicts <- rbind(mvdeps_area_ch4_ests, max_area_ch4_ests, mean_area_ch4_ests) 
+
+ch4_umol_predicts_wide <- ch4_umol_predicts %>% 
+  mutate(ch4_umol_type = paste(est_type, area_type, sep = "-")) %>% 
+  dplyr::select(dep_id, ch4_umol, ch4_umol_type) %>%
+  split(ch4_umol_predicts$dep_id) %>% 
+  purrr::map(~spread(.x, ch4_umol_type, ch4_umol)) %>%
+  bind_rows()
+
+# ch4_flux_predicts <- ch4_umol_predicts %>% 
+#   mutate(k600 = 0.5,
+#          fluxmmolm2day = k600*ch4_umol)
+```
+
+```{r}
+ch4_umol_predicts_list <- ch4_umol_predicts %>%
+  mutate(ch4_umol_type = paste(est_type, area_type, sep = "-")) %>% 
+  dplyr::select(dep_id, ch4_umol, ch4_umol_type) %>%
+  split(ch4_umol_predicts$dep_id) 
+
+# make each list item repeat 365 times
+ch4_umol_predicts_list_ts <- ch4_umol_predicts_list %>%
+  purrr::map(~bind_rows(replicate(365, .x, simplify = FALSE))) %>% 
+  purrr::map(~mutate(.x, date = rep(seq.Date(as.Date("2017-10-01"), as.Date("2018-09-30"), length.out = 365), each = 9)))
+
+# then join with table from gsod to calculate fluxes
+gsod_kgas_sub <- gsod_kgas %>% dplyr::select(YEARMODA, kgas05_md, satCH4_umol)
+
+ch4_flux_predicts_list <- ch4_umol_predicts_list_ts %>% 
+  purrr::map(~left_join(.x, gsod_kgas_sub, by = c("date" = "YEARMODA"))) %>% 
+  purrr::map(~mutate(.x, flux_mmolm2day = kgas05_md*(ch4_umol - satCH4_umol)))
+  
+
+ch4_flux_predicts_list[[1]] %>% View()
+ch4_flux_predicts_df <- ch4_flux_predicts_list %>% 
+  bind_rows() 
+
+ch4_flux_predicts_df <- ch4_flux_predicts_df %>% 
+  mutate(ch4_est_type = substr(ch4_umol_type, 1, 7),
+         ch4_area_type = substr(ch4_umol_type, 9, nchar(ch4_umol_type)))
+# head(ch4_flux_predicts_df)
+ch4_flux_predicts_df_path <- file.path(data_dir, "results/ch4_flux_predicts.tsv")
+# system.time(vroom::vroom_write(ch4_flux_predicts_df, ch4_flux_predicts_df_path)) # 29,354,760 rows
+# 80 seconds!
+```
+
+# Multiply by the area of each dep_id and respective area, sum across all dep_ids and by area category
+
+Separate ch4_est type column into separate ones for area type and fit/high/low conf interval
+
+```{r}
+ch4_flux_predicts_list <- ch4_flux_predicts_list %>%
+  purrr::map(~mutate(.x, ch4_est_type = substr(ch4_umol_type, 1, 7),
+                     ch4_area_type = substr(ch4_umol_type, 9, nchar(ch4_umol_type))))
+
+```
+
+For each table, join with m2 area on dep_id and ch4_area_type to get area estimate for that wetland
+Multiply flux rate and area to get emissions
+
+```{r}
+mvdeps_size_cats_forFlux <- mvdeps_size_cats %>%
+  filter(inTI) %>%
+  dplyr::select(dep_id, area_cat, area_m2, max_waterpred_m2, mean_waterpred_m2) %>%
+  rename(mvdeps_area = area_m2, max_area = max_waterpred_m2, mean_area = mean_waterpred_m2) %>%
+  tidyr::gather(ch4_area_type, area_m2, mvdeps_area:mean_area)
+
+ch4_fluxTotal_predicts_list <- ch4_flux_predicts_list %>% 
+  purrr::map(~left_join(.x, mvdeps_size_cats_forFlux, by = c("dep_id", "ch4_area_type"))) %>%
+  purrr::map(~mutate(.x, flux_mmolday = flux_mmolm2day * area_m2))
+```
+
+```{r}
+ch4_fluxTotal_df <- ch4_fluxTotal_predicts_list %>% bind_rows()
+  
+ch4_fluxTotal_predicts_df_path <- file.path(data_dir, "results/ch4_fluxTotal_predicts.tsv")
+vroom::vroom_write(ch4_fluxTotal_df, ch4_fluxTotal_predicts_df_path) # 29,354,760 rows
+ch4_fluxTotal_df <- vroom::vroom(ch4_fluxTotal_predicts_df_path)
+head(ch4_fluxTotal_df)
+```
+
+# Summarize flux totals
+
+Total in each size class, by day 
+
+```{r}
+fluxTotal_sum1 <- ch4_fluxTotal_df %>% 
+  group_by(date, ch4_est_type, ch4_area_type, area_cat) %>%
+  summarise(sum_water_area = sum(area_m2), sum_flux = sum(flux_mmolday))
+fluxTotal_sum1 %>% write_csv(file.path(data_dir, "results/fluxTotal_xSizeclass_xDay.csv"))
+fluxTotal_sum1 <- read_csv(file.path(data_dir, "results/fluxTotal_xSizeclass_xDay.csv"))
+
+```
+
+```{r}
+fluxTotal_sum1 %>%
+  ggplot(aes(x = date, y = sum_flux)) +
+  geom_line(aes(col = area_cat)) +
+  facet_grid(vars(ch4_est_type), vars(ch4_area_type)) +
+  theme_bw()
+```
+
+```{r}
+fluxTotal_sum1 %>%
+  filter(date == "2017-10-01") %>% # water sum is same for every day
+  ggplot(aes(x = area_cat, y = sum_water_area/1e6)) + # multiply by 365 for cumulative water area
+  geom_bar(aes(fill = ch4_area_type), stat = "identity", position = 'dodge', color = "black") +
+  theme_bw()
+```
+
+Total cumulative for each depression
+
+```{r}
+fluxTotal_sum2 <- ch4_fluxTotal_df %>% 
+  group_by(dep_id, ch4_umol_type, ch4_area_type) %>%
+  summarise(sum_water_area = sum(area_m2, na.rm = TRUE),
+            sum_flux = sum(flux_mmolday, na.rm = TRUE))
+fluxTotal_sum2 %>% write_csv(file.path(data_dir, "results/fluxTotal_xDepression.csv"))
+fluxTotal_sum2 <- read_csv(file.path(data_dir, "results/fluxTotal_xDepression.csv"))
+
+```
+
+Total cumulative in each size class
+
+```{r}
+fluxTotal_sum3 <- ch4_fluxTotal_df %>% group_by(area_cat, ch4_est_type, ch4_area_type) %>%
+  summarise(sum_water_area = sum(area_m2), sum_flux = sum(flux_mmolday, na.rm = TRUE))
+fluxTotal_sum3 %>% write_csv(file.path(data_dir, "results/fluxTotal_xSizeClass.csv"))
+```
+
+```{r}
+fluxTotal_sum3 %>%
+  ggplot(aes(x = area_cat, y = sum_water_area/1e6)) + 
+  geom_bar(aes(fill = ch4_area_type), stat = "identity", position = 'dodge', color = "black") +
+  theme_bw()
+```
+
+```{r}
+fluxTotal_sum3 %>%
+  ggplot(aes(x = ch4_area_type, y = sum_flux/1e6)) + 
+  geom_bar(aes(fill = area_cat), stat = "identity", color = "black") +
+  facet_wrap(vars(ch4_est_type)) +
+  theme_bw()
+```
+
+```{r}
+fluxTotal_sum3 %>%
+  ggplot(aes(x = ch4_area_type, y = sum_flux/1e6)) + 
+  geom_bar(aes(fill = area_cat), stat = "identity", position = 'dodge', color = "black") +
+  facet_wrap(vars(ch4_est_type)) +
+  theme_bw()
+```
+
+
+# Dynamic inundation 
+
+```{r}
+head(mov_avg_ts)
+mov_avg_ts_forFlux <- mov_avg_ts %>% dplyr::select(dep_id, imgDate, water_ma) %>% 
+  rename(dyn_area = water_ma) %>% tidyr::gather(ch4_area_type, area_m2, dyn_area) %>% filter(!is.na(area_m2))
+
+# ch4_flux_predicts_list[["01278"]]
+results_dir <- file.path(data_dir, "results", "ch4_flux_predicts")
+if(!fs::dir_exists(results_dir)){fs::dir_create(results_dir)}
+
+# too slow to join all at once, so separate list into separate files and join one at a time
+names(ch4_flux_predicts_list) %>%
+  purrr::walk(~vroom_write(ch4_flux_predicts_list[[.x]], path = file.path(results_dir, sprintf("dep_id-%s.tsv", .x))))
+
+mov_avg_ts_forFlux %>% vroom_write(file.path(data_dir, "results/mov_avg_ts_forFlux.tsv"))
+# ch4_fluxTotal_predicts_list <- ch4_flux_predicts_list %>% 
+#   purrr::map(~left_join(.x, mov_avg_ts_forFlux, by = c("dep_id", "ch4_area_type", "date" = "imgDate"))) %>% # large join, too slow
+#   purrr::map(~mutate(.x, flux_mmolday = flux_mmolm2day * area_m2))
+```
+
+Function to do joins on cluster
+```{r}
+mydep_id <- dep_ids_Notcalced[1]
+mydep_id
+calculate_flux_dyn_area <- function(mydep_id){
+  data_dir <- "/nfs/khondula-data/planetmethane"
+  mov_avg_ts_forFlux <- vroom(file.path(data_dir, "results/mov_avg_ts_forFlux.tsv"))
+  ch4_flux_predicts_mydep_path <- file.path(data_dir, sprintf("results/ch4_fluxRate_predicts/dep_id-%s.tsv", mydep_id))
+  ch4_fluxRate_predicts_mydep <- vroom(ch4_flux_predicts_mydep_path, col_types = c("cdcDdddcc"))
+
+ch4_flux_predicts_mydep <- ch4_fluxRate_predicts_mydep %>%
+  rename(ch4_fluxrate_area_type = ch4_area_type) %>%
+  dplyr::left_join(mov_avg_ts_forFlux, by = c("dep_id", "date" = "imgDate")) %>%
+  dplyr::mutate(flux_mmolday = flux_mmolm2day * area_m2)
+
+  results_dir <- file.path(data_dir, "results", "ch4_flux_predicts")
+  if(!fs::dir_exists(results_dir)){fs::dir_create(results_dir)}
+  vroom_write(ch4_flux_predicts_mydep, path = file.path(results_dir, sprintf("dep_id-%s.tsv", mydep_id)))
+  
+}
+calculate_flux_dyn_area(mydep_id = names(ch4_flux_predicts_list)[2])
+```
+
+
+run on cluster
+```{r}
+library(vroom)
+library(dplyr)
+library(rslurm)
+library(fs)
+pars <- data.frame(mydep_id = dep_ids_Notcalced,
+                   stringsAsFactors = FALSE)
+
+sjob3 <- rslurm::slurm_apply(calculate_flux_dyn_area,
+                            pars, 
+                            jobname = "joins3", 
+                            # pkgs = c("tabularaster", "fasterize", "velox", "raster", "sf", "dplyr", "readr", "tidyr", "fs"),
+                            slurm_options = list(time = "1:00:00", partition = "sesync"),
+                            nodes = 20, 
+                            cpus_per_node = 2,
+                            submit = TRUE)
+
+rslurm::print_job_status(sjob3)
+length(list.files("/nfs/khondula-data/planetmethane/results/ch4_flux_predicts/"))
+dep_ids_calced <- substr(list.files("/nfs/khondula-data/planetmethane/results/ch4_flux_predicts/"), 8, 12)
+length(dep_ids_calced)
+dep_ids_Notcalced <- names(ch4_flux_predicts_list)[!names(ch4_flux_predicts_list) %in% dep_ids_calced]
+length(dep_ids_Notcalced)
+```
+
+```{r}
+data_dir <- "/nfs/khondula-data/planetmethane"
+results_dir <- file.path(data_dir, "results", "ch4_flux_predicts")
+ch4_fluxTotal_files <- fs::dir_ls(results_dir)
+# ch4_fluxTotal_df <- vroom::vroom(ch4_fluxTotal_files, col_types = c("cdcDdddcccdd"), altrep_opts = TRUE, progress = TRUE)
+# head(ch4_fluxTotal_df)
+# ch4_fluxTotal_predicts_df_path <- file.path(data_dir, "results/ch4_fluxTotal_predicts_dynamic.tsv")
+# vroom::vroom_write(ch4_fluxTotal_df, ch4_fluxTotal_predicts_df_path) # 29,354,760 rows
+```
+
+
+# Summarize flux totals - dynamic
+
+```{r}
+data_dir <- "/nfs/khondula-data/planetmethane"
+results_dir <- file.path(data_dir, "results", "ch4_flux_predicts")
+ch4_fluxTotal_files <- fs::dir_ls(results_dir)
+```
+
+Total in each size class, by day 
+
+```{r}
+# fluxTotal_sum1 <- ch4_fluxTotal_df %>% group_by(date, ch4_est_type, ch4_area_type, area_cat) %>%
+  # summarise(sum_water_area = sum(area_m2), sum_flux = sum(flux_mmolday))
+# fluxTotal_sum1 %>% write_csv(file.path(data_dir, "results/fluxTotal_xSizeclass_xDay.csv"))
+```
+
+Total cumulative for each depression
+
+```{r}
+mydep_id <- '00002'
+sum_flux_dyn_area <- function(mydep_id){
+  data_dir <- "/nfs/khondula-data/planetmethane"
+  results_dir <- file.path(data_dir, "results", "ch4_flux_predicts")
+  mydep_ch4_flux_file <- file.path(results_dir, sprintf("dep_id-%s.tsv", mydep_id))
+
+  ch4_flux_predicts_mydep <- vroom::vroom(mydep_ch4_flux_file)
+  fluxTotal_sum3 <- ch4_flux_predicts_mydep %>% group_by(dep_id, ch4_est_type, ch4_fluxrate_area_type) %>%
+    summarise(sum_flux = sum(flux_mmolday, na.rm = TRUE),
+              sum_water_area = sum(area_m2, na.rm = TRUE),
+                  na_count = sum(is.na(flux_mmolday))) # add a column to count NAs
+
+  results_dir <- file.path(data_dir, "results", "ch4_fluxTotal_dynamic")
+  if(!fs::dir_exists(results_dir)){fs::dir_create(results_dir)}
+  vroom::vroom_write(fluxTotal_sum3, path = file.path(results_dir, sprintf("dep_id-%s.tsv", mydep_id)))
+  
+}
+
+sum_flux_dyn_area(mydep_id = '00003')
+
+
+# length(mydep_ids)
+mydep_ids <- substr(list.files(file.path(data_dir, "results", "ch4_flux_predicts")), 8, 12)
+# fluxTotal_sum2 <- ch4_fluxTotal_df %>% group_by(dep_id, ch4_umol_type, ch4_area_type) %>%
+#   summarise(sum_water_area = sum(area_m2), sum_flux = sum(flux_mmolday))
+# fluxTotal_sum2 %>% write_csv(file.path(data_dir, "results/fluxTotal_xDepression.csv"))
+```
+
+```{r}
+library(vroom)
+library(dplyr)
+library(rslurm)
+library(fs)
+pars <- data.frame(mydep_id = mydep_ids,
+                   stringsAsFactors = FALSE)
+
+sjob3 <- rslurm::slurm_apply(sum_flux_dyn_area,
+                            pars, 
+                            jobname = "sums", 
+                            # pkgs = c("tabularaster", "fasterize", "velox", "raster", "sf", "dplyr", "readr", "tidyr", "fs"),
+                            slurm_options = list(time = "3:00:00", partition = "sesync"),
+                            nodes = 20, 
+                            cpus_per_node = 2,
+                            submit = TRUE)
+
+rslurm::print_job_status(sjob3)
+
+length(list.files("/nfs/khondula-data/planetmethane/results/ch4_fluxTotal_dynamic/"))
+# dep_ids_calced <- substr(list.files("/nfs/khondula-data/planetmethane/results/ch4_flux_predicts/"), 8, 12)
+# length(dep_ids_calced)
+# dep_ids_Notcalced <- names(ch4_flux_predicts_list)[!names(ch4_flux_predicts_list) %in% dep_ids_calced]
+# length(dep_ids_Notcalced)
+```
+
+# Summarizing
+
+```{r}
+data_dir <- "/nfs/khondula-data/planetmethane"
+ch4_fluxTotal_files <- fs::dir_ls(file.path(data_dir, "results", "ch4_fluxTotal_dynamic"))
+mvdeps_size_cats <- readr::read_csv("mvdeps_size_cats.csv") %>% 
+  filter(inTI) %>%
+  dplyr::select(dep_id, area_cat, area_m2)
+
+ch4_fluxTotal_df <- purrr::map_df(ch4_fluxTotal_files[1:2000],
+                                  ~readr::read_tsv(.x, col_types = "cccddc"))
+
+ch4_fluxTotal_df_summary01 <- ch4_fluxTotal_df %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(ch4_est_type, ch4_fluxrate_area_type, area_cat) %>%
+  summarise(sum_flux_all = sum(sum_flux),
+            sum_water_area_all = sum(sum_water_area)) %>%
+  mutate(time_series_type = 'dynamic')
+
+ch4_fluxTotal_df <- purrr::map_df(ch4_fluxTotal_files[2001:4000], 
+                                  ~readr::read_tsv(.x, col_types = "cccddc"))
+
+ch4_fluxTotal_df_summary02 <- ch4_fluxTotal_df %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(ch4_est_type, ch4_fluxrate_area_type, area_cat) %>%
+  summarise(sum_flux_all = sum(sum_flux),
+            sum_water_area_all = sum(sum_water_area)) %>%
+  mutate(time_series_type = 'dynamic')
+
+ch4_fluxTotal_df <- purrr::map_df(ch4_fluxTotal_files[4001:6000],
+                                  ~readr::read_tsv(.x, col_types = "cccddc"))
+
+ch4_fluxTotal_df_summary03 <- ch4_fluxTotal_df %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(ch4_est_type, ch4_fluxrate_area_type, area_cat) %>%
+  summarise(sum_flux_all = sum(sum_flux),
+            sum_water_area_all = sum(sum_water_area)) %>%
+  mutate(time_series_type = 'dynamic')
+
+ch4_fluxTotal_df <- purrr::map_df(ch4_fluxTotal_files[6001:8936],
+                                  ~readr::read_tsv(.x, col_types = "cccddc"))
+
+ch4_fluxTotal_df_summary04 <- ch4_fluxTotal_df %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(ch4_est_type, ch4_fluxrate_area_type, area_cat) %>%
+  summarise(sum_flux_all = sum(sum_flux),
+            sum_water_area_all = sum(sum_water_area)) %>%
+  mutate(time_series_type = 'dynamic')
+
+ch4_fluxTotal_df_summary <- rbind(ch4_fluxTotal_df_summary01, 
+                                  ch4_fluxTotal_df_summary02,
+                                  ch4_fluxTotal_df_summary03,
+                                  ch4_fluxTotal_df_summary04) %>%
+  group_by(ch4_est_type, ch4_fluxrate_area_type, area_cat, time_series_type) %>%
+  summarise(sum_flux_all_rbind = sum(sum_flux_all),
+            sum_water_area_all_rbind = sum(sum_water_area_all))
+
+
+# add to flux total summary 3 table
+fluxTotal_sum3 <- readr::read_csv(file.path(data_dir, "results/fluxTotal_xSizeClass.csv"))
+fluxTotal_sum3 <- fluxTotal_sum3 %>% 
+  mutate(time_series_type = 'static')
+
+fluxTotal_sum_x_sizecat <- ch4_fluxTotal_df_summary %>% 
+  rename(sum_water_area = sum_water_area_all_rbind,
+         sum_flux = sum_flux_all_rbind,
+         ch4_area_type = ch4_fluxrate_area_type) %>%
+  dplyr::bind_rows(fluxTotal_sum3)
+```
+
+```{r}
+library(ggplot2)
+fluxTotal_sum_x_sizecat %>%
+  filter(ch4_est_type == 'est_fit') %>%
+  ggplot(aes(x = time_series_type, y = sum_flux/1e6)) +
+  geom_bar(stat = 'identity', aes(fill = area_cat)) +
+  facet_wrap(vars(ch4_area_type)) +
+  # facet_grid(vars(ch4_area_type), vars(ch4_est_type)) +
+  theme_bw()
+
+fluxTotal_sum_x_sizecat %>%
+  ggplot(aes(x = time_series_type, y = sum_flux/1e6)) +
+  geom_bar(stat = 'identity', aes(fill = area_cat), position = 'dodge') +
+  facet_grid(vars(ch4_area_type), vars(ch4_est_type)) +
+  theme_bw()
+
+fluxTotal_sum_x_sizecat %>%
+  tidyr::spread(ch4_est_type, sum_flux) %>%
+  ggplot(aes(x = time_series_type, y = est_fit/1e6, fill = area_cat)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  geom_errorbar(aes(ymax = est_upr/1e6, ymin = est_lwr/1e6), 
+                width = 0.2,
+                position = position_dodge(width = 0.9)) +
+  facet_wrap(vars(ch4_area_type)) +
+  theme_bw()
+
+```
+
+water area cumulative
+```{r}
+fluxTotal_sum_x_sizecat %>%
+  ggplot(aes(x = time_series_type, y = sum_water_area/1e6)) +
+  geom_bar(stat = 'identity', aes(fill = area_cat)) +
+  facet_wrap(vars(ch4_area_type)) +
+  theme_bw()
+```
+
+Summarize by day across size classes
+
+```{r}
+data_dir <- "/nfs/khondula-data/planetmethane"
+# list.files(file.path(data_dir, "results", ))
+ch4_flux_files <- fs::dir_ls(file.path(data_dir, "results", "ch4_flux_predicts"))
+mvdeps_size_cats <- readr::read_csv("mvdeps_size_cats.csv") %>% 
+  filter(inTI) %>%
+  dplyr::select(dep_id, area_cat)
+medium_deps <- mvdeps_size_cats %>% filter(area_cat == 'medium') %>% pull(dep_id)
+
+medium_deps_files <- purrr::map_chr(medium_deps, ~grep(.x, ch4_flux_files, value = TRUE))
+medium_deps_files[1] %>% read_tsv()
+
+medium_deps_dailies <- purrr::map_df(medium_deps_files, ~read_tsv(.x, col_types = c("cdcDdddcccdd"))) %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(date, ch4_est_type, ch4_fluxrate_area_type, area_cat) %>%
+  summarise(daily_flux_sum = sum(flux_mmolday, na.rm = TRUE),
+            daily_area_sum = sum(area_m2, na.rm = TRUE)) %>% 
+  mutate(time_series_type = "dynamic")
+
+small_deps <- mvdeps_size_cats %>% filter(area_cat == 'small') %>% pull(dep_id)
+small_deps_files <- purrr::map_chr(small_deps, ~grep(.x, ch4_flux_files, value = TRUE))
+
+small_deps_dailies <- purrr::map_df(small_deps_files, ~read_tsv(.x, col_types = c("cdcDdddcccdd"))) %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(date, ch4_est_type, ch4_fluxrate_area_type, area_cat) %>%
+  summarise(daily_flux_sum = sum(flux_mmolday, na.rm = TRUE),
+            daily_area_sum = sum(area_m2, na.rm = TRUE)) %>% 
+  mutate(time_series_type = "dynamic")
+
+smallest_deps <- mvdeps_size_cats %>% filter(area_cat == 'smallest') %>% pull(dep_id)
+smallest_deps_files <- purrr::map_chr(smallest_deps, ~grep(.x, ch4_flux_files, value = TRUE))
+
+smallest_deps_dailies <- purrr::map_df(smallest_deps_files, ~read_tsv(.x, col_types = c("cdcDdddcccdd"))) %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(date, ch4_est_type, ch4_fluxrate_area_type, area_cat) %>%
+  summarise(daily_flux_sum = sum(flux_mmolday, na.rm = TRUE),
+            daily_area_sum = sum(area_m2, na.rm = TRUE)) %>% 
+  mutate(time_series_type = "dynamic")
+
+largest_deps <- mvdeps_size_cats %>% filter(area_cat == 'largest') %>% pull(dep_id)
+largest_deps_files <- purrr::map_chr(largest_deps, ~grep(.x, ch4_flux_files, value = TRUE))
+
+largest_deps_dailies <- purrr::map_df(largest_deps_files, ~read_tsv(.x, col_types = c("cdcDdddcccdd"))) %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(date, ch4_est_type, ch4_fluxrate_area_type, area_cat) %>%
+  summarise(daily_flux_sum = sum(flux_mmolday, na.rm = TRUE),
+            daily_area_sum = sum(area_m2, na.rm = TRUE)) %>% 
+  mutate(time_series_type = "dynamic")
+
+daily_fluxsums <- rbind(largest_deps_dailies, medium_deps_dailies, small_deps_dailies, smallest_deps_dailies)
+fluxTotal_sum1 <- readr::read_csv(file.path(data_dir, "results/fluxTotal_xSizeclass_xDay.csv")) %>%
+  mutate(time_series_type = 'static') %>%
+  rename(daily_flux_sum = sum_flux, daily_area_sum = sum_water_area,
+         ch4_fluxrate_area_type = ch4_area_type)
+daily_fluxsums_rbind <- daily_fluxsums %>% bind_rows(fluxTotal_sum1)
+daily_fluxsums_rbind %>% write_tsv("/nfs/khondula-data/planetmethane/results/daily_fluxsums_rbind.tsv")
+```
+
+```{r}
+daily_fluxsums_rbind <- readr::read_tsv("/nfs/khondula-data/planetmethane/results/daily_fluxsums_rbind.tsv")
+```
+
+```{r}
+daily_fluxsums_rbind %>%
+  filter(ch4_est_type == 'est_fit') %>%
+  ggplot(aes(x = date, y = daily_flux_sum/1e6, group = area_cat)) +
+  geom_line(aes(color = area_cat)) +
+  geom_line(aes(color = area_cat), lwd = 0.5) +
+  facet_grid(vars(ch4_fluxrate_area_type), vars(time_series_type)) +
+  theme_bw()
+```
+
+```{r}
+daily_fluxsums %>%
+  ggplot(aes(x = date, y = daily_flux_sum, color = time_series_type)) +
+  geom_line() +
+  facet_grid(vars(ch4_est_type), vars(ch4_fluxrate_area_type)) +
+  theme_bw()
+```
+
+```{r}
+daily_fluxsums_rbind %>%
+  # filter(ch4_est_type == 'est_fit') %>%
+  group_by(date, ch4_est_type, ch4_fluxrate_area_type, time_series_type) %>%
+  summarise(daily_flux_sum_allsizes = sum(daily_flux_sum))
+```
+
+
+```{r}
+daily_fluxsums_rbind %>%
+  # filter(ch4_est_type == 'est_fit') %>%
+  group_by(date, ch4_est_type, ch4_fluxrate_area_type, time_series_type) %>%
+  summarise(daily_flux_sum_allsizes = sum(daily_flux_sum)) %>%
+  ggplot(aes(x = date, y = daily_flux_sum_allsizes/1e6)) +
+  geom_line(aes(color = time_series_type)) +
+  # geom_line(data = filter(daily_fluxsums_rbind, ch4_est_type == 'est_upr'),
+  #           aes(color = area_cat), alpha = 0.5, lty = 1) +
+  # geom_line(data = filter(daily_fluxsums_rbind, ch4_est_type == 'est_lwr'),
+  #           aes(color = area_cat), alpha = 0.5, lty = 1) +
+  facet_grid(vars(ch4_fluxrate_area_type), vars(ch4_est_type)) +
+  theme_bw()
+```
+
+Trying geom ribbon for fit upr and lower
+```{r}
+fit_uprs <- daily_fluxsums_rbind %>% filter(ch4_est_type != 'est_fit') %>% 
+  group_by(date, ch4_est_type, ch4_fluxrate_area_type, time_series_type) %>%
+  summarise(daily_flux_sum_allsizes = sum(daily_flux_sum)) %>%
+  tidyr::spread(ch4_est_type, daily_flux_sum_allsizes)
+  
+daily_fluxsums_rbind %>%
+  filter(ch4_est_type == 'est_fit') %>%
+  group_by(date, ch4_est_type, ch4_fluxrate_area_type, time_series_type) %>%
+  summarise(daily_flux_sum_allsizes = sum(daily_flux_sum)/1e6) %>%
+  ggplot(aes(x = date)) +
+  geom_ribbon(data = fit_uprs, aes(ymin = est_lwr/1e6, ymax = est_upr/1e6, fill = time_series_type),
+                                   alpha = 0.25) +
+  geom_line(aes(y = daily_flux_sum_allsizes, color = time_series_type), lwd = 1.25) +
+  facet_grid(vars(ch4_fluxrate_area_type)) +
+  theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2")
+```
+
+Cumulative water area plot
+```{r}
+daily_fluxsums_rbind %>% 
+    filter(ch4_est_type != 'est_fit') %>%
+  dplyr::select(- daily_flux_sum) %>%
+  group_by(date, time_series_type, ch4_fluxrate_area_type) %>%
+  summarise(daily_area_total = sum(daily_area_sum, na.rm = TRUE)) %>%
+  arrange(date) %>% 
+  ungroup() %>%
+  group_by(time_series_type, ch4_fluxrate_area_type) %>%
+  mutate(qum_area_sum = cumsum(daily_area_total)) %>% ungroup() %>%
+   ggplot(aes(x = date)) +
+  geom_line(aes(y = qum_area_sum/1e6, color = time_series_type), lwd = 1.25) +
+  facet_wrap(vars(ch4_fluxrate_area_type)) +
+  theme_bw() +   scale_color_brewer(palette = "Dark2")
+
+```
+
+Try cumulative ribbon plot
+```{r}
+fit_uprs_qum <- daily_fluxsums_rbind %>% 
+    filter(ch4_est_type != 'est_fit') %>%
+  group_by(date, ch4_est_type, ch4_fluxrate_area_type, time_series_type) %>%
+  summarise(daily_flux_sum = sum(daily_flux_sum, na.rm = TRUE)) %>%
+  arrange(date) %>% 
+  ungroup() %>%
+  group_by(ch4_est_type, ch4_fluxrate_area_type, time_series_type) %>%
+  mutate(qum_flux_sum = cumsum(daily_flux_sum)) %>% ungroup() %>%
+  dplyr::select(-daily_flux_sum) %>%
+  spread(ch4_est_type, qum_flux_sum)
+
+daily_fluxsums_rbind %>% 
+  filter(ch4_est_type == 'est_fit') %>%
+  group_by(date, ch4_fluxrate_area_type, time_series_type) %>%
+  summarise(daily_flux_sum = sum(daily_flux_sum, na.rm = TRUE)) %>%
+  arrange(date) %>% 
+  ungroup() %>%
+  group_by(ch4_fluxrate_area_type, time_series_type) %>%
+  mutate(qum_flux_sum = cumsum(daily_flux_sum)) %>%
+  ggplot(aes(x = date)) +
+  geom_ribbon(data = fit_uprs_qum, aes(ymin = est_lwr/1e6, ymax = est_upr/1e6, fill = time_series_type),
+                                   alpha = 0.25) +
+  geom_line(aes(y = qum_flux_sum/1e6, color = time_series_type), lwd = 1.25) +
+  facet_grid(vars(ch4_fluxrate_area_type), scales = "free") +
+  theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2")
+
+```
+
+```{r}
+daily_fluxsums_rbind %>% 
+  filter(ch4_est_type == 'est_fit') %>%
+  group_by(date, ch4_fluxrate_area_type, time_series_type) %>%
+  summarise(daily_flux_sum = sum(daily_flux_sum, na.rm = TRUE)) %>%
+  arrange(date) %>% 
+  ungroup() %>%
+  group_by(ch4_fluxrate_area_type, time_series_type) %>%
+  mutate(qum_flux_sum = cumsum(daily_flux_sum)) %>%
+  ggplot(aes(x = date)) +
+  geom_ribbon(data = fit_uprs_qum, aes(ymin = est_lwr/1e6, ymax = est_upr/1e6, fill = ch4_fluxrate_area_type),
+                                   alpha = 0.25) +
+  geom_line(aes(y = qum_flux_sum/1e6, color = ch4_fluxrate_area_type), lwd = 1.25) +
+  facet_wrap(vars(time_series_type), ncol = 2) +
+  theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_color_brewer(palette = "Dark2")
+
+```
+
+```{r}
+fit_uprs2 <- daily_fluxsums_rbind %>% 
+  filter(ch4_est_type != 'est_fit') %>% 
+  # group_by(date, ch4_est_type, ch4_fluxrate_area_type, time_series_type) %>%
+  # summarise(daily_flux_sum_allsizes = sum(daily_flux_sum)) %>%
+  tidyr::spread(ch4_est_type, daily_flux_sum)
+  
+daily_fluxsums_rbind %>%
+  filter(ch4_est_type == 'est_fit') %>%
+  ggplot(aes(x = date, group = time_series_type)) +
+  geom_ribbon(data = fit_uprs2, aes(ymin = est_lwr/1e6, ymax = est_upr/1e6,
+                                    fill = time_series_type), alpha = 0.25) +
+  geom_line(aes(color = time_series_type, y = daily_flux_sum/1e6)) +
+  facet_grid(vars(ch4_fluxrate_area_type), vars(area_cat)) +
+  theme_bw()
+```
+
+Plot mvdeps area vs mean area
+
+```{r}
+ readr::read_csv("mvdeps_size_cats.csv") %>% 
+  filter(inTI) %>%
+  filter(area_cat != "largest") %>%
+  ggplot(aes(x = area_m2, y = mean_waterpred_m2)) +
+  geom_abline(slope = 1, intercept = 0, lty = 2, col = "red") +
+  geom_point(alpha = 0.25) +
+  geom_abline(slope = 1, intercept = 0, lty = 2, col = "red") +
+  geom_smooth(method = "lm") +
+  theme_bw() +
+  expand_limits(y = 0, x = 0) +
+  # scale_x_log10() + scale_y_log10() +
+  facet_wrap(vars(area_cat), ncol = 1, scales = "free")
+```
+
+# Percent of total flux from water bodies with different sizes
+
+Summarize total by depression
+```{r}
+data_dir <- "/nfs/khondula-data/planetmethane"
+ch4_fluxTotal_files <- fs::dir_ls(file.path(data_dir, "results", "ch4_fluxTotal_dynamic"))
+mvdeps_size_cats <- readr::read_csv("mvdeps_size_cats.csv") %>% 
+  filter(inTI) %>%
+  dplyr::select(dep_id, area_cat, area_m2)
+
+ch4_fluxTotal_df <- purrr::map_df(ch4_fluxTotal_files[1:2000],
+                                  ~readr::read_tsv(.x, col_types = "cccddc"))
+
+ch4_fluxTotal_df_summary01 <- ch4_fluxTotal_df %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(dep_id, ch4_est_type, ch4_fluxrate_area_type) %>%
+  summarise(sum_flux_all = sum(sum_flux),
+            sum_water_area_all = sum(sum_water_area)) %>%
+  mutate(time_series_type = 'dynamic')
+
+ch4_fluxTotal_df <- purrr::map_df(ch4_fluxTotal_files[2001:4000], 
+                                  ~readr::read_tsv(.x, col_types = "cccddc"))
+
+ch4_fluxTotal_df_summary02 <- ch4_fluxTotal_df %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(dep_id, ch4_est_type, ch4_fluxrate_area_type) %>%
+  summarise(sum_flux_all = sum(sum_flux),
+            sum_water_area_all = sum(sum_water_area)) %>%
+  mutate(time_series_type = 'dynamic')
+
+ch4_fluxTotal_df <- purrr::map_df(ch4_fluxTotal_files[4001:6000],
+                                  ~readr::read_tsv(.x, col_types = "cccddc"))
+
+ch4_fluxTotal_df_summary03 <- ch4_fluxTotal_df %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(dep_id, ch4_est_type, ch4_fluxrate_area_type) %>%
+  summarise(sum_flux_all = sum(sum_flux),
+            sum_water_area_all = sum(sum_water_area)) %>%
+  mutate(time_series_type = 'dynamic')
+
+ch4_fluxTotal_df <- purrr::map_df(ch4_fluxTotal_files[6001:8936],
+                                  ~readr::read_tsv(.x, col_types = "cccddc"))
+
+ch4_fluxTotal_df_summary04 <- ch4_fluxTotal_df %>% 
+  left_join(mvdeps_size_cats) %>% 
+  group_by(dep_id, ch4_est_type, ch4_fluxrate_area_type) %>%
+  summarise(sum_flux_all = sum(sum_flux),
+            sum_water_area_all = sum(sum_water_area)) %>%
+  mutate(time_series_type = 'dynamic')
+
+ch4_fluxTotal_df_summary <- rbind(ch4_fluxTotal_df_summary01, 
+                                  ch4_fluxTotal_df_summary02,
+                                  ch4_fluxTotal_df_summary03,
+                                  ch4_fluxTotal_df_summary04)
+
+
+```
+
+## compute ecdf values
+
+```{r}
+# fluxTotal_sum2_forjoin <- ch4_fluxTotal_df_summary %>% 
+#   dplyr::select(dep_id, sum_water_area_all, sum_flux_all) %>% ungroup() %>%
+#   rename(sum_static_water_area = sum_water_area_all, sum_static_flux = sum_flux_all) %>%
+#   filter(ch4_umol_type == 'est_upr-mvdeps_area') %>% dplyr::select(-ch4_umol_type)
+
+fluxTotal_sum2_forjoin_upr_mean <- fluxTotal_sum2 %>% 
+  dplyr::select(dep_id, sum_water_area, sum_flux) %>% ungroup() %>%
+  rename(sum_static_water_area = sum_water_area, sum_static_flux = sum_flux) %>%
+  filter(ch4_umol_type == 'est_upr-mean_area') %>% dplyr::select(-ch4_umol_type)
+fluxTotal_sum2_forjoin_fit <- fluxTotal_sum2 %>% 
+  dplyr::select(dep_id, sum_water_area, sum_flux) %>% ungroup() %>%
+  rename(sum_static_water_area = sum_water_area, sum_static_flux = sum_flux) %>%
+  filter(ch4_umol_type == 'est_fit-mvdeps_area') %>% dplyr::select(-ch4_umol_type)
+fluxTotal_sum2_forjoin_lwr <- fluxTotal_sum2 %>% 
+  dplyr::select(dep_id, sum_water_area, sum_flux) %>% ungroup() %>%
+  rename(sum_static_water_area = sum_water_area, sum_static_flux = sum_flux) %>%
+  filter(ch4_umol_type == 'est_lwr-mvdeps_area') %>% dplyr::select(-ch4_umol_type)
+
+ch4_fluxTotal_ecdf <- ch4_fluxTotal_df_summary %>%
+  filter(ch4_est_type == 'est_upr', ch4_fluxrate_area_type == 'mvdeps_area') %>%
+  left_join(mvdeps_size_cats) %>% 
+  left_join(fluxTotal_sum2_forjoin) %>%
+  arrange(area_m2) %>% ungroup() %>% 
+  filter(!is.na(sum_static_flux)) %>% # not sure why there are NAs here
+  mutate(flux_qum = cumsum(sum_flux_all)) %>%
+  mutate(flux_qum_scale = flux_qum/max(flux_qum)) %>%
+  mutate(static_area_yr = area_m2*365) %>%
+  mutate(static_area_qum = cumsum(static_area_yr)) %>%
+  mutate(static_area_qum_scale = static_area_qum/max(static_area_qum)) %>%
+  mutate(area_qum = cumsum(sum_water_area_all)) %>%
+  mutate(area_qum_scale = area_qum/max(area_qum)) %>%
+  mutate(static_flux_qum = cumsum(sum_static_flux)) %>%
+  mutate(static_flux_qum_scale = static_flux_qum/max(static_flux_qum, na.rm = TRUE))
+
+filter(ch4_fluxTotal_ecdf, area_m2 < (30*30)) %>%
+  summarise(flux_prop = sum(sum_flux_all)) %>% 
+  pull(flux_prop)/max(ch4_fluxTotal_ecdf$flux_qum)
+
+filter(ch4_fluxTotal_ecdf, area_m2 < (30*30)) %>%
+  summarise(water_prop = sum(sum_water_area_all)) %>%
+  pull(water_prop)/max(ch4_fluxTotal_ecdf$area_qum)
+
+filter(ch4_fluxTotal_ecdf, area_m2 < (10000)) %>%
+  summarise(water_prop = sum(sum_water_area_all)) %>%
+  pull(water_prop)/max(ch4_fluxTotal_ecdf$area_qum)
+
+filter(ch4_fluxTotal_ecdf, area_m2 < (30*30)) %>%
+  summarise(water_prop = sum(static_area_yr)) %>% 
+  pull(water_prop)/max(ch4_fluxTotal_ecdf$static_area_qum)
+filter(ch4_fluxTotal_ecdf, area_m2 < (30*30)) %>%
+  summarise(flux_prop = sum(sum_static_flux)) %>% 
+  pull(flux_prop)/max(ch4_fluxTotal_ecdf$static_flux_qum)
+
+# find proportion of all emissions below 30 x 30 size
+f2 <- ch4_fluxTotal_ecdf %>% 
+  ggplot(aes(x = area_m2/1e6)) +
+  geom_line(aes(y = flux_qum_scale), color = "purple", lwd = 1) +
+  geom_line(aes(y = area_qum_scale), color = "blue", lwd = 1) +
+  # geom_line(aes(y = static_area_qum_scale), col = "blue", lty = 2) +
+  # geom_line(aes(y = static_flux_qum_scale), col = "purple", lty = 2) +
+  geom_vline(xintercept = (30*30)/1e6, lty = 2) +
+  scale_x_log10() + theme_bw() +
+    xlab("Water body size (km2)") +
+  ylab("Proportion of cumulative")
+
+pdf("fluxArea_ecdf_ts.pdf", width = 5, height = 4)
+print(f2)
+dev.off()
+
+ch4_fluxTotal_ecdf %>% 
+  ggplot(aes(x = area_m2/1e6)) +
+  geom_line(aes(y = flux_qum), color = "purple", lwd = 2) +
+  # geom_line(aes(y = area_qum_scale), color = "blue", lwd = 2) +
+  # geom_line(aes(y = static_area_qum_scale), col = "blue", lty = 2) +
+  geom_line(aes(y = static_flux_qum), col = "purple", lty = 2) +
+  geom_vline(xintercept = (30*30)/1e6, lty = 2) +
+  scale_x_log10() + theme_bw() +
+    xlab("Water body size (km2)") +
+  ylab("cumulative")
+
+ch4_fluxTotal_ecdf %>% 
+  ggplot(aes(x = area_m2/1e6)) +
+  # geom_line(aes(y = flux_qum), color = "purple", lwd = 2) +
+  geom_line(aes(y = area_qum), color = "blue", lwd = 2) +
+  geom_line(aes(y = static_area_qum), col = "blue", lty = 2) +
+  # geom_line(aes(y = static_flux_qum), col = "purple", lty = 2) +
+  geom_vline(xintercept = (30*30)/1e6, lty = 2) +
+  scale_x_log10() + theme_bw() +
+    xlab("Water body size (km2)") +
+  ylab("cumulative")
+```
+
+

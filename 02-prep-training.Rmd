@@ -1,0 +1,513 @@
+---
+title: "Prepare training data"
+author: "Kelly Hondula"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(dplyr)
+library(fasterize)
+data_dir <- "/nfs/khondula-data/planetmethane"
+```
+
+# Create AOI
+
+This creates AOI and AOI_union polygons
+
+Download watershed boundary for 
+
+Tuckahoe Creek
+0206000501
+
+Watts Creek-Choptank
+0206000502
+
+```{r}
+download.file("https://prd-tnm.s3.amazonaws.com/StagedProducts/Hydrography/NHD/HU8/HighResolution/Shape/NHD_H_02060005_HU8_Shape.zip", "/nfs/khondula-data/planetmethane/polygons/wbd/HUC8_02060005.zip")
+unzip("/nfs/khondula-data/planetmethane/polygons/wbd/HUC8_02060005.zip", 
+      exdir = "/nfs/khondula-data/planetmethane/polygons/wbd")
+```
+
+# HUC 8s 
+
+Read in USGS defined HUC 8 boundaries for Tuckahoe and Greensboro, merge into one polygon. 
+
+```{r}
+wbd <- st_read("/nfs/khondula-data/planetmethane/polygons/wbd/Shape/WBDHU10.shp") %>% 
+  dplyr::filter(Name %in% c("Tuckahoe Creek", "Watts Creek-Choptank River"))
+ucrw <- wbd %>% st_union()
+plot(ucrw)
+# st_write(ucrw, "data/UCRW.shp")
+```
+
+# HUC 12s 
+
+Read in USGS defined HUC 12 boundaries 
+
+```{r}
+huc12 <- st_read("/nfs/khondula-data/planetmethane/polygons/wbd/Shape/WBDHU12.shp")
+tuckahoe <- huc12 %>% 
+  filter(HUC12 %in% grep("0206000501", huc12$HUC12, value = TRUE))
+plot(tuckahoe$geometry)
+watts <- huc12 %>% 
+  filter(HUC12 %in% grep("0206000502", huc12$HUC12, value = TRUE))
+plot(watts$geometry)
+plot(tuckahoe$geometry, add = TRUE)
+ucrwHUC12 <- rbind(tuckahoe, watts)
+plot(ucrwHUC12$geometry)
+```
+
+```{r}
+ucrwHUC12 %>%
+  leaflet() %>%
+  # addTiles() %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%
+  addPolygons(label = ~Name)
+```
+
+Subset to the top 4 headwater catchments and join them as one polygon
+
+```{r}
+AOI <- ucrwHUC12 %>% dplyr::filter(Name %in% c("Cow Marsh Creek", "Upper Mason Branch", "Tappahanna Ditch-Choptank River", "Gravelly Branch-Choptank River"))
+
+
+AOI <- AOI %>% st_union(by_feature = FALSE)
+plot(AOI_union)
+plot(AOI$geometry)
+st_write(AOI, "/nfs/khondula-data/planetmethane/polygons/AOI.shp")
+st_write(AOI_union, "/nfs/khondula-data/planetmethane/polygons/AOI_union.shp")
+```
+
+```{r}
+AOI %>% 
+  leaflet() %>%
+  # addTiles() %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%
+  addPolygons(label = ~Name)
+```
+
+```{r}
+rm(huc12, tuckahoe, ucrw, ucrwHUC12, watts, wbd)
+```
+
+```{r}
+AOI <- st_read("/nfs/khondula-data/planetmethane/polygons/AOI_union.shp")
+```
+
+# MVdeps 
+
+Use dataset from M Vanderhoof (link)[https://www.sciencebase.gov/catalog/item/59370e80e4b0f6c2d0d899d5]
+
+Depression IDs generated here based on entire dataset
+
+```{r}
+library(sf)
+library(readr)
+library(leaflet)
+library(dplyr)
+library(raster)
+library(ggplot2)
+library(stringr)
+```
+
+There are 3 files
+
+* depressions
+* Landsat 2015
+* TotalStreamNetwork
+
+```{r}
+mv_dir <- "/nfs/khondula-data/Delmarva/data/vanderhoofUCRW"
+# landsat <- sf::st_read(mv_dir, "Landsat_2015_UCRW") %>% st_as_sf()
+mvdepressions <- sf::st_read(mv_dir, "depressions_UCRW") %>% 
+  st_as_sf() 
+mvdepressions <- mvdepressions %>% 
+  mutate(dep_id = str_pad(1:nrow(mvdepressions), width = 5, pad = "0"))
+st_write(mvdepressions, "/nfs/khondula-data/planetmethane/polygons/mvdepressions.shp")
+```
+
+```{r}
+mvdepressions <- sf::st_read("/nfs/khondula-data/planetmethane/polygons/mvdepressions.shp")
+head(mvdepressions)
+mvdepressions_df <- mvdepressions %>% st_drop_geometry() %>%
+  dplyr::mutate(area_m2 = ha*10000)
+
+# RSQLite::dbWriteTable(planetch4_db, "mvdepressions", mvdepressions)
+```
+
+```{r}
+# landsat %>% 
+#   st_transform(4326) %>%
+#   leaflet() %>%
+#   addProviderTiles(providers$Esri.WorldImagery) %>%
+#   # addTiles() %>%
+#   addPolygons()
+```
+
+Leaflet map of all depressions
+
+```{r, eval=FALSE}
+mvdepressions %>% 
+  st_transform(4326) %>%
+  leaflet() %>%
+  setView(lng = -75.825057, lat = 39.061090, zoom = 14) %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%
+  # addTiles() %>%
+  addPolygons()
+```
+
+Leaflet map of all depressions along with WBD 
+
+```{r, eval=FALSE}
+wbd <- "https://hydro.nationalmap.gov/arcgis/services/wbd/MapServer/WMSServer"
+
+mvdepressions %>% 
+  st_transform(4326) %>%
+  leaflet() %>%
+  setView(lng = -75.825057, lat = 39.061090, zoom = 14) %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%
+  # addTiles() %>%
+  addPolygons(group = "depressions") %>%
+  addWMSTiles(wbd, layers = "7",
+              options = WMSTileOptions(format = "image/png", transparent = TRUE),
+              group = "WBD transparent") %>%
+  addLayersControl(overlayGroups = c("depressions", "WBD transparent"))
+```
+
+## Size distribution of depressions
+
+```{r}
+mvdepressions %>%
+  ggplot(aes(x = ha)) +
+  geom_histogram() +
+  scale_x_log10()
+```
+
+```{r}
+mvdepressions %>%
+  ggplot(aes(x = ha)) +
+  stat_ecdf() +
+  scale_x_log10() +
+  theme_bw() + 
+  ylab("Proportion") +
+  xlab("Size (ha)")
+```
+
+Clip everything below some size threshold for faster plotting
+
+```{r, eval = FALSE}
+wbd <- "https://hydro.nationalmap.gov/arcgis/services/wbd/MapServer/WMSServer"
+
+mvdepressions %>% 
+  dplyr::filter(ha > 0.5) %>%
+  st_transform(4326) %>%
+  leaflet() %>%
+  setView(lng = -75.825057, lat = 39.061090, zoom = 14) %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%
+  # addTiles() %>%
+  addPolygons(group = "depressions", popup = ~as.character(dep_id)) %>%
+  # addPolygons(data = st_transform(ucrw, 4326)) %>%
+  # addWMSTiles(wbd, layers = "7",
+  #             options = WMSTileOptions(format = "image/png", transparent = TRUE),
+  #             group = "WBD transparent") %>%
+  addLayersControl(overlayGroups = c("depressions"))
+```
+
+
+# Crop depressions to AOI
+
+
+```{r}
+planet_crs <- "+proj=utm +zone=18 +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0"
+```
+
+```{r}
+mvdeps_cropAOI <- mvdepressions %>% 
+  st_transform(planet_crs) %>% 
+  st_crop(st_transform(AOI_union, planet_crs))
+```
+
+Buffer to 20m 
+
+```{r}
+mvdeps_cropAOI_buffer20m <- mvdeps_cropAOI %>% st_transform(5070) %>% 
+  st_buffer(20) %>% st_transform(planet_crs)
+st_write(mvdeps_cropAOI_buffer20m,
+         "/nfs/khondula-data/planetmethane/polygons/mvdeps_cropAOI_buffer20m.shp")
+```
+
+# Subset depressions
+
+Use NWI dataset to identify overlap with farm ponds and forested wetlands.
+
+
+Read in NWI and crop to AOI extent
+
+```{r}
+# download.file(url = "http://www.fws.gov/wetlands/downloads/Watershed/HU8_02060005_watershed.zip", "/nfs/khondula-data/planetmethane/nwi/HU8_02060005_watershed.zip")
+# unzip("/nfs/khondula-data/planetmethane/nwi/HU8_02060005_watershed.zip",
+#       exdir = "/nfs/khondula-data/planetmethane/nwi/")
+nwi <- sf::st_read("/nfs/khondula-data/planetmethane/nwi/HU8_02060005_Watershed",
+layer = "HU8_02060005_Wetlands")
+nwi_prj <- nwi %>% st_transform(crs = planet_crs)
+
+nwi_cropAOI <- nwi_prj %>% st_crop(AOI_union)
+# plot(nwi_cropAOI$geometry)
+
+# choptank_ws <- sf::st_read("/nfs/khondula-data/planetmethane/nwi/HU8_02060005_Watershed",
+# layer = "HU8_02060005_Watershed")
+# choptank_ws_prj <- choptank_ws %>% 
+#   st_transform(crs = planet_crs)
+
+```
+
+Take out farm ponds
+
+```{r}
+farmed_nwi <- dplyr::filter(nwi_cropAOI, ATTRIBUTE == "Pf")
+
+mat <- mvdeps_cropAOI %>% st_intersects(farmed_nwi, sparse = FALSE)
+depressions_pF <- which(apply(mat, 1, any))
+
+mvdeps_cropAOI_subset <- mvdeps_cropAOI[-depressions_pF,]
+```
+
+Map
+
+```{r}
+mvdeps_cropAOI_subset %>%
+  st_transform(4326) %>%
+  leaflet() %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%
+  addPolygons(color = "orange", fillOpacity = 0, label = ~as.character(dep_id)) %>%
+  addPolygons(data = st_transform(AOI_union, 4326), fillOpacity = 0, color = "black")
+ 
+```
+
+```{r}
+nwi_cropAOI_4326 <- st_transform(nwi_cropAOI, 4326)
+mvdeps_cropAOI_subset_4326 <- st_transform(mvdeps_cropAOI_subset, 4326)
+```
+
+
+OLD below here
+
+# Get file list
+
+```{r}
+# pdfiles <- list.files("/nfs/khondula-data/planetmethane/data", full.names = TRUE, recursive = TRUE, pattern = ".tiff")
+# files <- grep("_SR.tif", pdfiles, value = TRUE)
+```
+
+Find min and max x and y bounds for files
+
+```{r}
+# filesxmin <- min(purrr::map_dbl(files, ~raster::extent(stack(.x))@xmin))
+# filesxmax <- max(purrr::map_dbl(files, ~raster::extent(stack(.x))@xmax))
+# filesymin <- min(purrr::map_dbl(files, ~raster::extent(stack(.x))@ymin))
+# filesymax <- max(purrr::map_dbl(files, ~raster::extent(stack(.x))@ymax))
+# img01_bigextent <- files[1] %>% stack() %>%
+  # raster::setExtent(ext = extent(c(filesxmin, filesxmax, filesymin, filesymax)))
+```
+
+```{r}
+# depressions_prj <- mvdepressions %>% st_transform(crs = proj4string(img01_bigextent))
+
+# depressions_prj_crop <- depressions_prj %>% st_crop(st_bbox(img01_bigextent))
+
+# sf::write_sf(wetlands_join, "../../data/NWI_wetlands_cropped.shp") # not working to save
+```
+
+
+Get NWI polygons for extent of image
+
+```{r}
+# transform to equal area projection (EPSG: 5070)
+# depressions_prj_crop_aea <- depressions_prj_crop %>% st_transform(crs = 5070)
+
+# # buffer  polygons to 60m
+# mdnwi_60m <- st_buffer(mdnwi_aea, 60)
+# # buffer  polygons to 20m
+# depressions_20m <- st_buffer(depressions_prj_crop_aea, 20)
+```
+
+
+Crop NWI to area of depressions
+
+```{r}
+# nwi_aea <- nwi_prj %>% st_transform(crs = 5070)
+# nwi_aea$WETLAND_TY %>% unique()
+# nwi_forest <- dplyr::filter(nwi_aea, WETLAND_TY %in% c("Freshwater Forested/Shrub Wetland", "Freshwater Pond", "Freshwater Emergent Wetland"))
+# grep("f", unique(nwi_aea$ATTRIBUTE), value = TRUE)
+```
+
+Take out farm ponds
+
+```{r}
+# farmed_nwi_crop <- farmed_nwi %>% st_crop(st_bbox(depressions_20m))
+
+# mat <- depressions_20m %>% st_intersects(farmed_nwi_crop, sparse = FALSE)
+# depressions_pF <- which(apply(mat, 1, any))
+
+# depressions_20m_subset <- depressions_20m[-depressions_pF,]
+
+# test2 <- depressions_20m[depressions_pF,]
+```
+
+
+```{r}
+# test2 %>% 
+  # st_transform(4326) %>%
+  # leaflet() %>%
+  # setView(lng = -75.825057, lat = 39.061090, zoom = 14) %>%
+  # addProviderTiles(providers$Esri.WorldImagery) %>%
+  # addTiles() %>%
+  # addPolygons()
+```
+
+
+
+
+
+
+```{r}
+# depressions_20m_subset_sp <- as(depressions_20m_subset, "Spatial")
+# 
+# depressions_20m_subset <- depressions_20m_subset %>% 
+#   st_transform(crs = proj4string(raster::stack(files[1])))
+# 
+# selected_deps_buffer <- selected_deps_buffer %>%
+#   st_transform(crs = proj4string(raster::stack(files[1])))
+# 
+# extract_save_ndwi <- function(imgfile){
+#   wetland_polygons <- selected_deps_buffer
+#   bufferdist = 20
+#   wetland_type = "selected-depressions"
+#   
+#   imgID <- imgfile %>% basename() %>% tools::file_path_sans_ext()
+#   imgstack <- raster::stack(imgfile)
+#   img_vx <- velox::velox(imgstack)
+#   # calculate NDWI
+#   b2 <- img_vx$as.matrix(band = 2)
+#   b4 <- img_vx$as.matrix(band = 4)
+#   img_ndwi <- (b2-b4)/(b2+b4)
+#   img_ndwi_vx <- velox::velox(img_ndwi, 
+#                               extent = raster::extent(imgstack), 
+#                               res = raster::res(imgstack))
+#   
+#   img_extract <- img_ndwi_vx$extract(wetland_polygons, df = TRUE) %>% rename(ndwi = 2)
+#   
+#   extract_filename <- paste0("data/ndwi_extract_data/", gsub(" ", "-", wetland_type),
+#                              "_",imgID, "_", bufferdist, "m", ".csv")
+#   readr::write_csv(img_extract, extract_filename)
+# }
+# 
+# files <- fs::dir_ls("/nfs/khondula-data/planetmethane/data/")
+# # extract_save_ndwi(imgfile = files[1], 
+#                   # wetland_polygons = depressions_20m_subset, 
+#                   # wetland_type = "depressions", bufferdist = 20)
+# 
+# extract_save_ndwi(files[1])
+# extract_save_ndwi(files[2])
+# 
+# purrr::walk(files[3:10], ~extract_save_ndwi(.x))
+# purrr::walk(files[11:38], ~extract_save_ndwi(.x))
+# purrr::walk(files[21:30], ~extract_save_ndwi(.x))
+# purrr::walk(files[31:38], ~extract_save_ndwi(.x))
+
+```
+
+# Selected depressions
+
+```{r}
+# selected_deps_id <- c("10127", "10112", "10162", "10367", "10097", "10002", "09829")
+```
+
+```{r}
+# selected_deps_buffer <- mvdepressions %>%
+#   dplyr::filter(dep_id %in% selected_deps_id) %>%
+#   st_transform(5070) %>%
+#   st_buffer(20)
+```
+
+```{r}
+mvdepressions <- sf::st_read("/nfs/khondula-data/planetmethane/polygons/mvdepressions.shp")
+```
+
+
+
+# training data
+
+New approach for training data 14 May 2019
+
+Upland training data = NLCD woody wetland, etc. area MINUS all NWI area and MVdeps
+Water training data = NWI ponds and lakes X mvdeps 
+
+```{r}
+planet_crs <- "+proj=utm +zone=18 +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0"
+AOI <- st_read("/nfs/khondula-data/planetmethane/polygons/AOI_union.shp") %>% st_transform(planet_crs)
+# ww_area <- st_read(file.path(data_dir, "polygons", "ww_areas.shp")) %>% st_transform(planet_crs)
+# ww_areas gets made in nlcd.R file. shp file doesnt behave after being saved... 
+# ww_areas_prj <- ww_areas %>% st_as_sf() %>% st_transform(planet_crs)
+nwi <- st_read(file.path(data_dir, "nwi", "HU8_02060005_Watershed", "HU8_02060005_Wetlands.shp")) %>% 
+                 # dplyr::filter(WETLAND_TY %in% c("Freshwater Pond", "Lake")) %>% 
+                 st_transform(planet_crs)
+nwi_crop <- st_join(nwi, AOI, left = FALSE) %>% st_transform(proj4string(nlcd_aoi_mask))
+nwi_crop_buff30 <- nwi_crop %>% st_transform(5070) %>% 
+  st_buffer(30) %>% st_transform(proj4string(nlcd_aoi_mask)) %>% st_cast(to = "POLYGON")
+```
+
+```{r}
+nwi_crop_r_template <- fasterize::raster(nwi_crop_buff30, res = res(nlcd_aoi_mask), ext = extent(nlcd_aoi_mask))
+nwi_crop_r <- fasterize::fasterize(nwi_crop_buff30, raster = nwi_crop_r_template, field = "WETLAND_TY")
+plot(nwi_crop_r)
+plot(nwi_crop)
+```
+
+THen, mask nlcd with nwi_crop_r
+```{r}
+# nlcd_aoi_mask %>% plot()
+ww_areas_maskNWI <- raster::mask(x = nlcd_aoi_mask, mask = nwi_crop_r, inverse = TRUE)
+ww_areas_maskNWI %>% plot()
+```
+
+Do same thing with mvdeps - buffer to 30m then rasterize 
+
+```{r}
+mvdeps_crop <- st_join(mvdepressions, AOI, left = FALSE) %>% st_transform(proj4string(nlcd_aoi_mask))
+mvdeps_crop_buff30 <- mvdeps_crop %>% st_transform(5070) %>% 
+  st_buffer(30) %>% st_transform(proj4string(nlcd_aoi_mask)) %>% st_cast(to = "POLYGON")
+mvdeps_crop_r_template <- fasterize::raster(mvdeps_crop_buff30, res = res(nlcd_aoi_mask), ext = extent(nlcd_aoi_mask))
+mvdeps_crop_r <- fasterize::fasterize(mvdeps_crop_buff30, raster = mvdeps_crop_r_template, field = "dep_id")
+plot(mvdeps_crop_r)
+```
+
+```{r}
+ww_areas_maskNWImvdeps <- raster::mask(x = ww_areas_maskNWI, mask = mvdeps_crop_r, inverse = TRUE)
+ww_areas_maskNWImvdeps %>% plot()
+```
+
+```{r}
+library(leaflet)
+nwi_crop %>%
+  st_transform(4326) %>%
+  leaflet() %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%
+  addRasterImage(ww_areas_maskNWImvdeps) %>%
+  addPolygons(opacity = 1, fillColor = "yellow", color = "black", weight = 0.5, group = "nwi") %>%
+  addLayersControl(overlayGroups = c("nwi"))
+```
+
+```{r}
+ww_areas_maskNWImvdeps %>% writeRaster("/nfs/khondula-data/planetmethane/ww_areas_maskNWImvdeps.tif")
+```
+
+```{r}
+# library(tabularaster)
+# ww <- as_tibble(ww_areas_maskNWI)
+# head(ww)
+```
+
+

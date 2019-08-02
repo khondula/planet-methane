@@ -1,0 +1,1152 @@
+---
+title: "Time series"
+author: "Kelly Hondula"
+date: "4/19/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(mgcv)
+library(lubridate)
+library(zoo)
+library(purrr)
+library(dplyr)
+library(fs)
+library(readr)
+```
+
+Once classifications are extracted, daily time series can be developed from the combinations of water-classified pixel sums and imagery dates, using a moving average smoother. 
+
+```{r}
+rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_v2/")
+mvdeps_buffered_areas <- readr::read_csv("/nfs/khondula-data/planetmethane/metadata/mvdeps_buffered_area.csv") %>%
+  mutate(area_m2 = ha*10000)
+
+rf_predicts <- purrr::map_df(rf_predicts_files, ~read_csv(.x, col_types = c("cdd")), .id = "filename") %>%
+  dplyr::mutate(imgID = substr(basename(filename), 11, 11+19)) %>% 
+  dplyr::mutate(imgDate = as.Date(substr(imgID, 1, 8), "%Y%m%d")) %>%
+  dplyr::select(-filename) %>%
+  dplyr::mutate(n_pixels = uplan + water) %>%
+   mutate(ID_splp = stringr::str_pad(ID_sp, width= 5, side = "left", pad = "0")) %>% ungroup() %>%
+  dplyr::select(-ID_sp) %>%
+  dplyr::rename(ID_sp = ID_splp)
+
+rf_predicts %>% head()
+# unique(rf_predicts$imgID) %>% length()
+# unique(rf_predicts$ID_sp) %>% length()
+no_mvdeps <- rf_predicts$ID_sp %>% unique() %>% length()
+message(no_mvdeps, " depressions in models")
+no_imgs_inmodels <- rf_predicts$imgID %>% unique() %>% length()
+message(no_imgs_inmodels, " images in models")
+no_dates_inmodels <- rf_predicts$imgDate %>% unique() %>% length()
+message(no_dates_inmodels, " dates in models")
+
+# calculate area in m2 and filter out incomplete observations
+rf_predicts <- rf_predicts %>% 
+  dplyr::group_by(ID_sp) %>% 
+  mutate(max_n = max(n_pixels)) %>% # max pixels for polygon
+  dplyr::mutate(prop_water = water/n_pixels) %>% # proportion of water pixels
+  mutate(all_pixels = n_pixels == max_n) %>% # check for all pixels
+  filter(all_pixels) %>% # check for all pixels 
+  mutate(water_m2 = water*9) %>% # pixels to m2 area
+  mutate(max_water_prop = max(prop_water), 
+         min_water_prop = min(prop_water), 
+         range_water = max_water_prop - min_water_prop) %>%
+  arrange(ID_sp)
+```
+
+Filter out bad images then Separate into a list based on polygon ID
+
+```{r}
+bad_imgs <- c("20171221_154345_103f", # test quality
+              "20180102_151220_103a" # snow cover
+              )
+
+rf_predicts <- rf_predicts %>% filter(!imgID %in% bad_imgs)
+
+no_mvdeps <- rf_predicts$ID_sp %>% unique() %>% length()
+message(no_mvdeps, " depressions in models")
+no_imgs_inmodels <- rf_predicts$imgID %>% unique() %>% length()
+message(no_imgs_inmodels, " images in models")
+no_dates_inmodels <- rf_predicts$imgDate %>% unique() %>% length()
+message(no_dates_inmodels, " dates in models")
+
+rf_predicts_forTS <- rf_predicts %>% 
+  dplyr::select(imgID, imgDate, ID_sp, water_m2, prop_water, max_water_prop, min_water_prop, range_water)
+
+rf_predicts_list_forTS <- rf_predicts_forTS %>% split(rf_predicts_forTS$ID_sp)
+
+```
+
+Each item in the list is predictions (water, prop_water) for a given polygon.
+
+# Smoothing time series with a running median
+
+The Cooley et al approach uses a running median, so it can be somewhat justified. Load the zoo package and use a rolling mean with rollmean 
+
+To get a consistent number of days in the rolling window function, need to join with all days data frame and figure out what to do with duplicate values from the same day
+
+
+Filter 1 - Take out any that have less than X number of observations (10)
+
+```{r}
+nobs_thresh = 10 # SET Number of Observations threshold here
+
+nrows <- rf_predicts_list_forTS %>% purrr::map_int(~nrow(.x)) %>% unlist()
+nobs_perwetland <- data.frame(ID_sp = names(rf_predicts_list_forTS), nrow = nrows) %>% arrange(nrow)
+
+nobs_perwetland %>% ggplot(aes(x = nrow)) + geom_histogram(binwidth = 1)
+filter(nobs_perwetland, nrow < nobs_thresh) %>% nrow()
+
+IDs_toremove <- nobs_perwetland %>% filter(nrow < nobs_thresh) %>% pull(ID_sp) %>% as.character()
+IDs_tokeep <- nobs_perwetland %>% filter(nrow >= nobs_thresh) %>% pull(ID_sp) %>% as.character()
+
+length(rf_predicts_list_forTS)
+length(IDs_toremove)
+rf_predicts_list_forTS <- rf_predicts_list_forTS[IDs_tokeep]
+length(rf_predicts_list_forTS)
+```
+
+## Filter 2-  based on max gap between images (this is used for moving window width)
+
+Find the maximum gap in the time series for each polygon
+
+```{r}
+ma_window_max <- rf_predicts_list_forTS %>%
+  purrr::map(~arrange(.x, imgID)) %>%
+  purrr::map(~mutate(.x, img_datetime = as.POSIXct(substr(imgID, 1, 15), format = "%Y%m%d_%H%M%S"))) %>% 
+  purrr::map(~mutate(.x, prior_img_difftime = lag(img_datetime, 1))) %>%
+  purrr::map(~mutate(.x, img_interval = difftime(img_datetime, prior_img_difftime, units = "days"))) %>%
+  purrr::map(~mutate(.x, img_interval_days = round(as.numeric(img_interval)))) 
+
+ma_window_max_df <- ma_window_max %>% 
+  purrr::map_df(~summarise(.x, max_interval = 1+ max(img_interval_days, na.rm = TRUE)))
+
+ma_window_max_list <- ma_window_max %>% 
+  purrr::map(~summarise(.x, max_interval = 1+ max(img_interval_days, na.rm = TRUE))) %>%
+  purrr::map(~pull(.x, max_interval))
+
+head(ma_window_max_df)
+ma_window_max_df$max_interval %>% summary()
+ma_window_max_df %>% ggplot(aes(x = max_interval)) + geom_histogram() +
+  expand_limits(x = 0)
+```
+
+
+```{r}
+interval_tresh = 60 # SET Interval threshold here
+
+ma_window_max_df %>% ggplot(aes(x = max_interval)) + stat_ecdf()
+ma_window_max_df %>% ggplot(aes(x = max_interval)) + 
+  geom_histogram(binwidth = 5) + geom_vline(xintercept = interval_tresh, col = "red") +
+  xlab("max interval (days)")
+summary(ma_window_max_df$max_interval)
+
+IDs_tokeep2 <- ma_window_max_df %>% filter(max_interval < interval_tresh) %>% pull(ID_sp) %>% as.character()
+IDs_longmaxwindow <- ma_window_max_df %>% filter(max_interval >= interval_tresh) %>% pull(ID_sp) %>% as.character()
+length(IDs_longmaxwindow)
+length(IDs_longmaxwindow[!IDs_longmaxwindow %in% IDs_toremove])
+
+IDs_tokeep_bothfilters <- IDs_tokeep[which(IDs_tokeep %in% IDs_tokeep2)]
+
+rf_predicts_list_forTS <- rf_predicts_list_forTS[IDs_tokeep_bothfilters]
+length(rf_predicts_list_forTS)
+```
+
+# MOOving window averages
+
+Average days with multiple observations, then combine with a data frame of all dates within range in order to do moving window
+
+```{r}
+study_days_df <- data.frame(date = seq.Date(from = as.Date("2017-10-01"), by = 1, length.out = 365))
+# this does joins to prep for moving avg calculation
+rf_predicts_list_forzoo <- rf_predicts_list_forTS %>% 
+  purrr::map(~group_by(.x, imgDate, ID_sp)) %>%
+  purrr::map(~summarise(.x, water_m2_avg = mean(water_m2, na.rm = TRUE))) %>% 
+  purrr::map(~left_join(.x, ma_window_max_df, by = c("ID_sp"))) %>%
+  purrr::map(~right_join(.x, study_days_df, by = c("imgDate" = "date"))) %>%
+  purrr::map(~as.data.frame(.x))
+
+rf_predicts_list_forzoo[[1]] %>% head()
+length(rf_predicts_list_forzoo) # make sure there are still same number of items in list 
+# rf_predicts_list_forzoo %>% sapply(function(x) nrow(x))
+rf_predicts_list_mov_avg <- names(rf_predicts_list_forzoo) %>%
+  purrr::map(~mutate(rf_predicts_list_forzoo[[.x]], 
+                     ma_window_max = ma_window_max_list[[.x]],
+                     water_ma = zoo::rollapply(water_m2_avg, 
+                                               partial = TRUE,
+                                               width = ma_window_max_list[[.x]],
+                                               FUN = median, 
+                                               # fill = NA,
+                                               na.rm = TRUE)))
+#rename
+names(rf_predicts_list_mov_avg) <- sprintf("dep_%s", names(rf_predicts_list_forzoo))
+rf_predicts_list_mov_avg[[2]] %>% head()
+# then do rolling mean function based on ID_sp name
+# purrr::map(~mutate(.x, water_ma = zoo::rollapply(water_m2_avg, width = max_interval, FUN = median, na.rm = TRUE, fill = NA))) %>% head()
+
+mov_avg_ts <- rf_predicts_list_mov_avg %>%
+  bind_rows(.id = "dep_id") %>% 
+   mutate(dep_id_chr = substr(dep_id, 5, 10)) %>%
+  dplyr::select(-dep_id) %>%
+  dplyr::rename(dep_id = dep_id_chr) %>%
+  dplyr::select(ID_sp, dep_id, imgDate, water_m2_avg, water_ma, ma_window_max)
+
+# mov_avg_ts %>% head()
+# mov_avg_ts %>% str()
+```
+
+```{r}
+mov_avg_ts_xdate <- mov_avg_ts %>%
+  group_by(imgDate) %>%
+  summarise(sum_swe = sum(water_ma, na.rm = TRUE),
+            n_deps = n(),
+            n_nas = sum(is.na(water_ma)))
+
+mov_avg_ts_xdep <- mov_avg_ts %>%
+  group_by(dep_id) %>%
+  summarise(sum_swe = sum(water_ma, na.rm = TRUE),
+            n_dates = n(),
+            n_nas = sum(is.na(water_ma)))
+```
+
+
+
+Create data frame with size classes
+
+
+```{r}
+mov_avg_ts_summary <- mov_avg_ts %>% 
+  group_by(dep_id) %>%
+  summarise(max_waterpred_m2 = max(water_m2_avg, na.rm = TRUE),
+            min_waterpred_m2 = min(water_m2_avg, na.rm = TRUE),
+            mean_waterpred_m2 = mean(water_m2_avg, na.rm = TRUE),
+            median_waterpred_m2 = median(water_m2_avg, na.rm = TRUE),
+            sum_waterpred_m2 = sum(water_m2_avg, na.rm = TRUE))
+
+mov_avg_ts_summary_xdate <- mov_avg_ts %>% 
+  left_join(mvdeps_size_cats[,c(2,6)]) %>%
+  group_by(area_cat, imgDate) %>%
+  summarise(sum_waterpred_m2 = sum(water_m2_avg, na.rm = TRUE))
+
+mov_avg_ts_summary_xdate %>%
+  # group_by(imgDate) %>% summarise(water_sum_allsizes = sum(water_sum)) %>%
+  ggplot(aes(x = imgDate, y = sum_waterpred_m2/1e6)) +
+  geom_bar(aes(fill = area_cat), stat = "identity", width = 1) + 
+  # scale_fill_brewer(palette = "Dark2") +
+  scale_fill_viridis_d() +
+  theme_bw() + xlab(element_blank()) + ylab("Surface water area (km2)")
+# mov_avg_ts_summary %>%
+#   left_join(mvdeps_size_cats) %>%
+#   mutate(area_m2_qum_static = area_m2*365) %>%
+#   mutate(ts_prop_static = sum_waterpred_m2/area_m2_qum_static) %>%
+#   filter(area_cat != 'largest') %>%
+#   # ggplot(aes(x = area_m2, y = median_waterpred_m2)) +
+#   ggplot(aes(x = area_m2_qum_static, y = sum_waterpred_m2)) +
+#   geom_abline(slope = 1, intercept = 0, col = "red") +
+#   geom_point(alpha = 0.5) + facet_wrap(vars(area_cat), scales = "free")
+```
+
+
+```{r}
+mvdeps_size_cats <- mvdeps_buffered_areas %>%
+  mutate(area_km2 = ha/100) %>%
+  mutate(area_cat = dplyr::case_when(area_km2 <0.001 ~ "smallest",
+                                     area_km2 >= 0.001 & area_km2 < 0.01 ~ "small",
+                                     area_km2 >= 0.01 & area_km2 < 0.1 ~ "medium",
+                                     area_km2 >= 0.1 ~ "largest")) %>%
+  left_join(mov_avg_ts_summary) %>%
+  mutate(inTI = dep_id %in% IDs_tokeep_bothfilters) # no predictions if didn't meet criteria
+
+table(mvdeps_size_cats$area_cat, mvdeps_size_cats$inTI)
+
+mvdeps_size_cats$area_cat %>% table()
+
+mvdeps_size_cats %>% write_csv("mvdeps_size_cats.csv")
+
+mvdeps_size_cats_summary <- mvdeps_size_cats %>% 
+  filter(inTI) %>%
+  group_by(area_cat) %>%
+  summarise(n_wetlands_in_sizecat = n(), 
+            sum_maxpred_area_km2 = sum(max_waterpred_m2)/1e6,
+            sum_meanpred_area_km2 = sum(mean_waterpred_m2)/1e6,
+            sum_medianpred = sum(median_waterpred_m2)/1e6,
+            sum_area_km2 = sum(area_m2)/1e6,
+            sum_buffered_area_km2 = sum(area_buffered_m2)/1e6)
+mvdeps_size_cats_summary
+
+mvdeps_size_cats_summary %>% 
+  tidyr::gather(area_defn, area_km2, sum_maxpred_area_km2:sum_buffered_area_km2) %>%
+  filter(area_defn != "sum_buffered_area_km2") %>%
+  ggplot(aes(x = area_cat, y = area_km2, fill = area_defn)) +
+  geom_bar(stat = "identity", position = position_dodge(), color = "black") +
+  theme_bw() +
+  scale_fill_viridis_d()
+
+mvdeps_size_cats_summary %>% 
+  tidyr::gather(area_defn, area_km2, sum_maxpred_area_km2:sum_buffered_area_km2) %>%
+  filter(area_defn != "sum_buffered_area_km2") %>%
+  ggplot(aes(x = area_defn, y = area_km2, fill = area_cat)) +
+  geom_bar(stat = "identity", color = "black") +
+  geom_hline(yintercept = 1.16, lty = 2, lwd = 1) + # pekel et al extent
+  geom_hline(yintercept = 5.52, lty = 1, lwd = 1, col = "black") + # min TS extent
+  geom_hline(yintercept = 12.6, lty = 1, lwd = 1, col = "black") + # max TS extent
+  # geom_hline(yintercept = 110.17, lty = 2, lwd = 1.5) +
+  theme_bw() +
+  scale_fill_viridis_d()
+
+```
+
+empiricial cumulative distribution plots for each polygon, faceted by area category. Not sure what this means
+
+```{r}
+mov_avg_ts %>%
+  left_join(mvdeps_size_cats) %>%
+  filter(!is.na(water_ma)) %>%
+  ggplot(aes(x = water_ma, group = dep_id, color = area_cat)) +
+  stat_ecdf(alpha = 0.5) +
+  facet_wrap(vars(area_cat), scales = "free")
+```
+
+Cumulative water area comparisons
+```{r}
+mov_avg_ts$ID_sp %>% unique() %>% length()
+
+mov_avg_ts %>% filter(!is.na(water_ma)) %>% pull(imgDate) %>% unique() %>% length()
+
+mov_avg_ts %>% left_join(mvdeps_size_cats) %>%
+  group_by(area_cat) %>%
+  summarise(sum_area_km2 = sum(water_ma, na.rm = TRUE)/1e6)
+mov_avg_ts %>% left_join(mvdeps_size_cats) %>%
+  summarise(sum_area_km2 = sum(water_ma, na.rm = TRUE)/1e6)
+```
+
+Plot every depression line individually
+
+```{r}
+mov_avg_ts %>% 
+  left_join(mvdeps_size_cats) %>% 
+  dplyr::filter(area_cat == "medium") %>% arrange(desc(water_ma)) %>% head()
+
+mov_avg_ts %>% 
+  left_join(mvdeps_size_cats) %>% 
+  # dplyr::filter(area_cat == "largest") %>% arrange(desc(water_ma)) %>% 
+  ggplot(aes(x = imgDate, y = water_ma, group = dep_id)) +
+  geom_line(alpha = 0.5, aes(col = area_cat)) + theme_bw() + 
+  ylab(expression(paste("Surface water extent (", m^2, ")"))) + 
+  xlab(element_blank()) + scale_color_viridis_d()
+  # scale_y_log10()
+  # facet_wrap(vars(area_cat), scales = "free")
+```
+
+This is to look at how the number of wetlands in each of the size categories changes throughout the time period
+```{r}
+mov_avg_ts_nonoas <- mov_avg_ts %>% 
+  left_join(mvdeps_size_cats) %>%
+  group_by(imgDate, area_cat) %>%
+  filter(!is.na(water_ma)) %>%
+  summarise(
+            water_sum_nonas = sum(water_ma),
+            n_wetlands = n())
+
+mov_avg_ts_prop_obs <- mov_avg_ts_nonoas %>% 
+  left_join(mvdeps_size_cats_summary) %>%
+  mutate(prop_wetlands_observed = n_wetlands/n_wetlands_in_sizecat)
+
+
+mov_avg_ts_prop_obs %>% 
+  ggplot(aes(x = imgDate, y = prop_wetlands_observed)) +
+  geom_line(aes(col = area_cat), lwd = 1) + theme_bw() +
+  scale_color_brewer(palette = "Dark2")
+```
+
+The total area of the AOI is 434.6859 km2 
+
+```{r}
+mov_avg_ts_summary %>% dplyr::select(-n_wetlands, -water_sum_nonas) %>%
+  tidyr::spread(area_cat, water_sum) %>% tidyr::gather(area_cat, area_m2, largest:smallest) %>%
+  group_by(imgDate) %>%
+  summarise(sum_area_km2 = sum(area_m2)/1e6) %>% arrange(sum_area_km2) %>% tail(20)
+
+mov_avg_ts_summary %>% 
+  ggplot(aes(x = imgDate, y = water_sum)) +
+  geom_line(aes(col = area_cat), lwd = 2) + theme_bw() +
+  scale_color_brewer(palette = "Dark2")
+
+# mov_avg_ts_filter_dates <- mov_avg_ts %>% filter(imgDate > as.Date("2017-10-22") & imgDate < as.Date("2018-09-06"))
+mov_avg_ts %>% write_csv('results_water-ts_full.csv')
+mov_avg_ts <- readr::read_csv('results_water-ts_full.csv')
+
+# mov_avg_ts_summary_filter_dates <- mov_avg_ts_summary %>%
+  # filter(imgDate > as.Date("2017-10-22") & imgDate < as.Date("2018-09-06")) # based on when large wetland has obs
+mov_avg_ts_summary %>% write_csv("results_water-ts.csv")
+mov_avg_ts_summary <- readr::read_csv("results_water-ts.csv")
+
+```
+
+One example here
+```{r}
+# dk_ts %>% 
+#   group_by(imgDate, study_days, ID_sp) %>% 
+#   summarise(water_m2_avg = mean(water_m2, na.rm = TRUE)) %>%
+#   right_join(study_days_df, by = c("imgDate" = "date")) %>% 
+#   as.data.frame() %>% 
+#   mutate(water_ma = rollapply(water_m2_avg, width = ma_window, FUN = median, na.rm = TRUE, fill = NA)) %>%
+#   ggplot(aes(x =imgDate, y = water_m2_avg )) + 
+#   geom_line(data = filter(wetland_areas, ID_sp == "10164"), aes(x = date, y = area_m2), col = "red") +
+#   geom_line(aes(y = water_ma), size = 1, col = "purple") +
+#     geom_point(pch = 21, size = 3, fill = "dodgerblue") + 
+#   theme_bw()
+```
+
+Cumulative water area using dynamic and different static estimates
+
+```{r}
+mvdeps_size_cats_summary_qum <- mvdeps_size_cats_summary %>% group_by(area_cat) %>%
+  transmute(sum_area_km2 = 365*sum_area_km2,
+            sum_buffered_area_km2 = 365*sum_buffered_area_km2,
+            sum_maxpred_area_km2 = 365*sum_maxpred_area_km2,
+            sum_meanpred_area_km2 = 365*sum_meanpred_area_km2,
+            sum_medianpred = 365*sum_medianpred)
+
+qum_comparison <- mov_avg_ts_summary %>% group_by(area_cat) %>%
+  summarise(water_qum_dyn_km2 = sum(water_sum, na.rm = TRUE)/1e6) %>%
+  left_join(mvdeps_size_cats_summary_qum, by = c("area_cat"))
+
+qum_comparison %>%
+  tidyr::gather(area_defn, area_qum, water_qum_dyn_km2:sum_medianpred) %>%
+  group_by(area_defn) %>%
+  summarise(sum_qum = sum(area_qum))
+```
+
+```{r}
+qum_comparison %>% 
+  tidyr::gather(area_defn, area_qum, water_qum_dyn_km2:sum_medianpred) %>%
+  filter(area_defn != "sum_buffered_area_km2") %>%
+  ggplot(aes(x = area_cat, y = area_qum, fill = area_defn)) +
+  geom_bar(stat = "identity", position = position_dodge(), color = "black") +
+  theme_bw() +
+  scale_fill_viridis_d()
+
+qum_comparison %>% 
+  tidyr::gather(area_defn, area_qum, water_qum_dyn_km2:sum_medianpred) %>%
+  filter(area_defn != "sum_buffered_area_km2") %>%
+  ggplot(aes(x = area_defn, y = area_qum, fill = area_cat)) +
+  geom_bar(stat = "identity", color = "black") +
+  theme_bw() +
+  scale_fill_viridis_d()
+```
+
+# Compare cumulative water area to field wetlands cumulative
+
+```{r}
+field_qum <- wetland_areas %>% 
+  filter(!is.na(ID_sp)) %>%
+  rename(dep_id = ID_sp) %>%
+  filter(date > as.Date("2017-09-30")) %>%
+  rename(imgDate = date) %>%
+  group_by(dep_id) %>% 
+  mutate(water_qum = cumsum(area_m2))
+field_qum_summary <- field_qum %>% summarise(field_water_qum = max(water_qum))
+```
+
+```{r}
+pred_qum <- mov_avg_ts %>% filter(dep_id %in% wetland_areas$ID_sp) %>%
+  group_by(dep_id) %>%
+  summarise(water_qum = sum(water_ma, na.rm = TRUE))
+
+mov_avg_ts %>% filter(dep_id %in% wetland_areas$ID_sp) %>%
+  group_by(dep_id) %>%
+  mutate(water_qum = cumsum(water_ma)) %>%
+  ggplot(aes(x = imgDate, y = water_qum, color = dep_id)) +
+  geom_line(lwd = 1.25) + 
+  geom_line(data = field_qum, lty = 2, lwd = 1) +
+  theme_bw() + ylab("Cumulative water area") +
+  facet_wrap(vars(dep_id))
+
+pred_qum %>% left_join(field_qum_summary) %>%
+  mutate(underest = (field_water_qum - water_qum)/field_water_qum)
+
+pred_qum %>% left_join(field_qum_summary) %>%
+  ggplot(aes(x = field_water_qum/1e6, y = water_qum/1e6)) +
+  geom_abline(slope = 1, intercept = 0, lty = 2) +
+  geom_point(pch = 21, aes(fill = dep_id), size = 3) +
+  theme_bw() +
+  ylim(c(0,0.4)) + xlim(c(0, 0.4)) + 
+  scale_fill_viridis_d()
+```
+
+
+```{r}
+rf_predicts %>%
+  dplyr::filter(!imgID %in% imgs_metadata_issues, all_pixels) %>%
+  dplyr::filter(imgID != "20171020_155435_0f2e") %>%
+  dplyr::filter(imgID != "20171017_155449_0f2e") %>%
+   dplyr::filter(ID_sp %in% c("09829", "10097", "10162", "10112", "09845",
+                             "09697", "10002", "09634", "10164")) %>%
+  left_join(mvdeps_buffered_areas, by = c("ID_sp" = "dep_id")) %>%
+  ggplot(aes(x = imgDate, y = water*9)) +
+  # geom_hline(aes(yintercept = area_buffered_m2), lty = 2) +
+  geom_hline(aes(yintercept = ha*10000), lty = 2) +
+  # geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs")) +
+  geom_line(data = filter(wetland_areas, !is.na(ID_sp)), aes(x = date, y = area_m2), col = "red") +
+  geom_point(pch = 21, size = 2) +
+  facet_wrap(vars(ID_sp), scales = "free") + theme_bw()
+
+```
+
+# Check figs with moving average smoother
+
+```{r}
+  data_dir <- "/nfs/khondula-data/planetmethane"
+  mov_avg_ts <- vroom::vroom(file.path(data_dir, "results/results_water-ts_full.csv"))
+  mvdeps_buffered_areas <- readr::read_csv("/nfs/khondula-data/planetmethane/metadata/mvdeps_buffered_area.csv") %>%
+    mutate(area_m2 = ha*10000)
+mydep_id <- '10162'
+my_ts <- filter(mov_avg_ts, dep_id == mydep_id)
+# area_nobuff <- filter(mvdeps_buffered_areas, dep_id == mydep_id) %>% pull(area_m2)
+# area_buff <- filter(mvdeps_buffered_areas, dep_id == mydep_id) %>% pull(area_buffered_m2)
+
+my_ts %>%
+    ggplot(aes(x = imgDate, y = water_ma)) +
+    # geom_hline(yintercept = area_nobuff, lty = 2) +
+    # geom_hline(yintercept = area_buff, lty = 2) +
+    geom_line(lwd = 2, color = "dodgerblue") +
+    # geom_point(aes(y = water_m2_avg), pch = 21, fill = "dodgerblue", size = 3) +
+    # geom_point(aes(y = water_m2_avg), pch = 21, fill = "gray", size = 3) +
+    expand_limits(y=0) +
+    ylab(expression(paste("Surface water extent (", m^2,")"))) +
+    xlab(element_blank()) +
+    theme_bw() +
+    ggtitle(mydep_id)
+
+```
+
+
+```{r}
+# mov_avg_ts <- vroom::vroom('results_water-ts_full.csv')
+library(ggplot2)
+library(vroom)
+library(dplyr)
+library(fs)
+
+area_prediction_plot <- function(mydep_id){
+  data_dir <- "/nfs/khondula-data/planetmethane"
+  mov_avg_ts <- vroom::vroom(file.path(data_dir, "results/results_water-ts_full.csv"))
+  mvdeps_buffered_areas <- readr::read_csv("/nfs/khondula-data/planetmethane/metadata/mvdeps_buffered_area.csv") %>%
+    mutate(area_m2 = ha*10000)
+  my_ts <- filter(mov_avg_ts, dep_id == mydep_id)
+  area_nobuff <- filter(mvdeps_buffered_areas, dep_id == mydep_id) %>% pull(area_m2)
+  area_buff <- filter(mvdeps_buffered_areas, dep_id == mydep_id) %>% pull(area_buffered_m2)
+  p1 <- my_ts %>%
+    ggplot(aes(x = imgDate, y = water_ma)) +
+    geom_hline(yintercept = area_nobuff, lty = 2) +
+    geom_hline(yintercept = area_buff, lty = 2) +
+    geom_line() +
+    geom_point(aes(y = water_m2_avg), pch = 21, fill = "green") +
+    expand_limits(y=0) +
+    ylab("water area (m2)") +
+    xlab(element_blank()) +
+    theme_bw() +
+    ggtitle(mydep_id)
+
+  figures_dir <- file.path(data_dir, "results", "figures", "time-series")
+  if(!fs::dir_exists(figures_dir)){fs::dir_create(figures_dir)}
+  figname <- sprintf(file.path(figures_dir, "%s.png"), mydep_id)
+  png(figname, width = 600, height = 400)
+  print(p1)
+  dev.off()
+  # return(p1)  
+}
+
+mydep_ids
+
+area_prediction_plot('10112')
+area_prediction_plot('10042')
+area_prediction_plot('10050')
+area_prediction_plot('09977')
+
+purrr::walk(mydep_ids[101:100], ~area_prediction_plot(.x))
+
+```
+
+```{r}
+pars <- data.frame(mydep_id = mydep_ids,
+                   stringsAsFactors = FALSE)
+
+sjob3 <- rslurm::slurm_apply(area_prediction_plot,
+                            pars, 
+                            jobname = "plots", 
+                            # pkgs = c("tabularaster", "fasterize", "velox", "raster", "sf", "dplyr", "readr", "tidyr", "fs"),
+                            slurm_options = list(time = "3:00:00", partition = "sesync"),
+                            nodes = 20, 
+                            cpus_per_node = 2,
+                            submit = TRUE)
+
+rslurm::print_job_status(sjob3)
+
+length(list.files("/nfs/khondula-data/planetmethane/results/figures/time-series/"))
+```
+
+Make this plot for all wetlands
+
+```{r}
+
+# bad_imgs <- c("20171017_155449_0f2e", "20171020_155435_0f2e", "20180524_151756_1027",
+#               "20171117_151027_1005", "20171117_154717_104c", 
+#               "20171117_151028_1005", "20171117_154718_104c",
+#               "20171117_154719_104c")
+
+myID_sp <- "06948"
+save_predict_checkfig <- function(myID_sp){
+  
+p1 <- rf_predicts %>%
+  dplyr::filter(!imgID %in% imgs_metadata_issues, all_pixels) %>%
+    dplyr::filter(!imgID %in% bad_imgs, all_pixels) %>%
+  dplyr::filter(ID_sp %in% myID_sp) %>%
+  left_join(mvdeps_buffered_areas, by = c("ID_sp" = "dep_id")) %>%
+  ggplot(aes(x = imgDate, y = water*9)) +
+  geom_hline(aes(yintercept = area_buffered_m2), lty = 2, col = "red") +
+  geom_hline(aes(yintercept = ha*10000), lty = 2, col = "red") +
+  geom_point(pch = 21, size = 3, fill = "green") +
+  facet_wrap(vars(ID_sp), scales = "free") + theme_bw() +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b")
+figname <- sprintf(file.path("figures", "rfpredict_checkfig", "%s.png"), myID_sp)
+png(figname, width = 600, height = 400)
+print(p1)
+dev.off()
+}
+purrr::walk(mvdeps_buffered_areas$dep_id[1:100], ~save_predict_checkfig(.x))
+save_predict_checkfig(myID_sp = "08743")
+```
+
+
+
+```{r}
+  data_dir <- "/nfs/khondula-data/planetmethane"
+  mov_avg_ts <- vroom::vroom(file.path(data_dir, "results/results_water-ts_full.csv"))
+  mvdeps_buffered_areas <- readr::read_csv("/nfs/khondula-data/planetmethane/metadata/mvdeps_buffered_area.csv") %>%
+    mutate(area_m2 = ha*10000)
+
+```
+
+
+```{r}
+mov_avg_ts_summary %>%
+  group_by(imgDate) %>% summarise(water_sum_allsizes = sum(water_sum)) %>%
+  ggplot(aes(x = imgDate, y = water_sum_allsizes)) +
+  geom_line(lwd = 2) + 
+  # scale_color_brewer(palette = "Dark2") +
+  theme_bw()
+```
+
+```{r}
+mov_avg_ts_summary %>%
+  # group_by(imgDate) %>% summarise(water_sum_allsizes = sum(water_sum)) %>%
+  ggplot(aes(x = imgDate, y = water_sum/1e6)) +
+  geom_bar(aes(fill = area_cat), stat = "identity", width = 1) + 
+  # scale_fill_brewer(palette = "Dark2") +
+  scale_fill_viridis_d() +
+  theme_bw() + xlab(element_blank()) + ylab("Surface water area (km2)")
+```
+
+
+Size distribution differences
+
+On any given date, what proportion of the area is made up of water bodies smaller than a given size class
+
+```{r}
+mov_avg_ts %>%
+  filter(water_ma > 0) %>% 
+  group_by(imgDate) %>% 
+    # filter(imgDate == '2017-10-01') %>% 
+  mutate(rank_size = rank(desc(water_ma), ties.method = 'random')) %>%
+  ggplot(aes(x = water_ma)) +
+  geom_density(aes(group = imgDate), alpha = 0.5) +
+  scale_x_log10() +
+  theme_bw()
+```
+
+```{r}
+mov_avg_ts %>%
+  filter(water_ma > 0) %>% 
+  group_by(imgDate) %>% 
+    # filter(imgDate == '2017-10-01') %>% 
+  mutate(rank_size = rank(desc(water_ma), ties.method = 'random')) %>% 
+  # arrange(water_ma) %>% 
+  # head()
+  ggplot(aes(x = water_ma/1e6, y = rank_size)) +
+    # geom_line(aes(group = imgDate, color = as.numeric(imgDate)), alpha = 0.5) +
+    geom_line(aes(group = imgDate), alpha = 0.5) +
+  scale_y_log10() + scale_x_log10() +
+  theme_bw() +
+  # scale_color_viridis_c() +
+  theme(legend.position = "none") +
+  ylab("Abundance") + xlab("Area (km2)")
+  
+```
+
+```{r}
+# mov_avg_ts %>% 
+#   group_by(imgDate) %>%
+#   ggplot(aes(x = as.factor(imgDate), y = water_ma)) +
+#   geom_boxplot(aes(group = imgDate), outlier.size = 0) +
+#   scale_y_log10()
+```
+
+```{r}
+mov_avg_ts %>%
+  # filter(water_ma > 0) %>% 
+  group_by(imgDate) %>%
+  summarise(mean_size = mean(water_ma, na.rm = TRUE),
+            median_size = median(water_ma, na.rm = TRUE),
+            max_size = max(water_ma, na.rm = TRUE),
+            min_size = min(water_ma, na.rm = TRUE),
+            q1 = quantile(water_ma, 0.25, na.rm = TRUE),
+            q3 = quantile(water_ma, 0.75, na.rm = TRUE)) %>%
+  ggplot(aes(x = imgDate, y = mean_size)) +
+  geom_line(lty = 3) +
+  geom_line(aes(y = median_size), lty = 2) +
+  geom_line(aes(y = q1)) +
+  geom_line(aes(y = q3)) +
+  geom_line(aes(y = min_size))
+
+```
+
+
+# OLD BELOW HERE
+
+
+
+
+
+
+
+# Smoothing time series with loess
+
+
+One complication here is that loess will not attempt to make predictions outside the bounds of the original data set, so unless artificial starts and ends are estimated, the end of the time series goes really high. Also loess with such a high span is good to reduce curviness and overfitting, but also means its probably too smooth. 
+
+```{r}
+
+lo95_list <- rf_predicts_list_forgam_filtered %>%
+  purrr::map(~loess(water_m2 ~ study_days, span = 0.95, 
+                    control = loess.control(surface = "interpolate"),
+                    data = .x))
+lo95_preds_list <- lo95_list %>%
+  purrr::map(~predict(.x, data.frame(study_days = 1:365), se = TRUE))
+
+lo95_preds_dfs_list <- lo95_preds_list %>%
+  purrr::map(~data.frame(x_new = 1:365,
+                         y_span95 = .x[["fit"]],
+                         y_span95se = .x[["se.fit"]])) %>%
+  purrr::map(~mutate(.x, y_span95_corr = case_when(y_span95 < 0 ~ 0, y_span95 >=0 ~ y_span95)))
+
+names(lo95_preds_dfs_list) <- names(rf_predicts_list_forgam_filtered)
+
+```
+
+```{r}
+# predicts <- data.frame(ID_sp =  rf_predicts_list_forgam_filtered[[3]][["ID_sp"]][1],
+#                        x_new,
+#                        y_span95 = lo95_pred$fit,
+#                        y_span95se = lo95_pred$se.fit,
+#                        y_span75 = lo75_pred$fit,
+#                        y_span75se = lo75_pred$se.fit,
+#                        y_span50 = lo50_pred$fit,
+#                        y_span50se = lo50_pred$se.fit) %>%
+#   mutate(y_span95_corr = case_when(y_span95 < 0 ~ 0, y_span95 >=0 ~ y_span95),
+#          y_span75_corr = case_when(y_span75 < 0 ~ 0, y_span75 >=0 ~ y_span75),
+#          y_span50_corr = case_when(y_span50 < 0 ~ 0, y_span50 >=0 ~ y_span50))
+
+# lo75_list <- rf_predicts_list_forgam_filtered %>%
+#   purrr::map(~loess(water_m2 ~ study_days, span = 0.75, 
+#                     control = loess.control(surface = "direct"),
+#                     data = .x))
+```
+
+Loess fits with 75, 95, and 50% span
+
+```{r}
+# lo95 <- loess(water_m2 ~ study_days, span = 0.95, 
+#               control = loess.control(surface = "direct"), # to extrapolate beyond data
+#               data = rf_predicts_list_forgam_filtered[[3]])
+# lo75 <- loess(water_m2 ~ study_days, span = 0.75, 
+#               control = loess.control(surface = "direct"),
+#               data = rf_predicts_list_forgam_filtered[[3]])
+# lo50 <- loess(water_m2 ~ study_days, span = 0.50, 
+#               control = loess.control(surface = "direct"),
+#               data = rf_predicts_list_forgam_filtered[[3]])
+# x_new <- 1:365
+# lo95_pred <- predict(lo95, data.frame(study_days = x_new), se = TRUE)
+# lo75_pred <- predict(lo75, data.frame(study_days = x_new), se = TRUE)
+# lo50_pred <- predict(lo50, data.frame(study_days = x_new), se = TRUE)
+# predicts <- data.frame(ID_sp =  rf_predicts_list_forgam_filtered[[3]][["ID_sp"]][1],
+#                        x_new,
+#                        y_span95 = lo95_pred$fit,
+#                        y_span95se = lo95_pred$se.fit,
+#                        y_span75 = lo75_pred$fit,
+#                        y_span75se = lo75_pred$se.fit,
+#                        y_span50 = lo50_pred$fit,
+#                        y_span50se = lo50_pred$se.fit) %>%
+#   mutate(y_span95_corr = case_when(y_span95 < 0 ~ 0, y_span95 >=0 ~ y_span95),
+#          y_span75_corr = case_when(y_span75 < 0 ~ 0, y_span75 >=0 ~ y_span75),
+#          y_span50_corr = case_when(y_span50 < 0 ~ 0, y_span50 >=0 ~ y_span50))
+# 
+# rf_predicts_list_forgam_filtered[[3]] %>%
+#   ggplot(aes(x = study_days, y = water_m2)) +
+#   geom_smooth(method = "loess", span = 0.95, se = FALSE) +
+#   geom_point()
+# 
+# lo95_preds_dfs_list[[5]] %>%
+#   ggplot(aes(x = x_new, y = y_span95_corr)) +
+#   geom_line() +
+#   # geom_line(aes(y = y_span95_corr), color = "blue") +
+#   geom_point(data = rf_predicts_list_forgam_filtered[[5]],
+#              aes(x = study_days, y = water_m2)) +
+#   theme_bw()
+
+```
+
+
+```{r}
+lo95_ts <- lo95_preds_dfs_list %>%
+  bind_rows(.id = "ID_sp")
+```
+
+```{r}
+lo95_ts
+```
+
+```{r}
+lo95_ts %>%
+  ggplot(aes(x = x_new, y = y_span95_corr, group = ID_sp)) +
+  geom_line(alpha = 0.1) +
+  coord_cartesian(ylim = c(0, 10000))
+```
+
+Group into size classes
+```{r}
+max_pred_water <- lo95_ts %>% 
+  group_by(ID_sp) %>%
+  summarise(max_water = max(y_span95_corr, na.rm = TRUE),
+            median_water = median(y_span95_corr, na.rm = TRUE)) %>% 
+  arrange(desc(max_water)) %>%
+  mutate(rank_max_water = rank(desc(max_water), ties.method = "random"))
+
+# size distribution
+# x = size, y = # greater than or equal to that size
+
+max_pred_water <- max_pred_water %>%
+  mutate(log_water_m2 = log(max_water)) %>% 
+  mutate(qtile = sprintf("q_%s", dplyr::ntile(log_water_m2, 4)))
+
+max_pred_water %>%
+  ggplot(aes(x = max_water)) + 
+  geom_histogram(fill = "blue", bins = 50) +
+  # geom_density(fill = "blue") + 
+  # scale_x_log10() +
+  theme_bw()
+
+max_pred_water$median_water %>% summary()
+
+max_pred_water %>% 
+  ggplot(aes(x = max_water, y = rank_max_water)) +
+  geom_point() +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme_bw() +
+  ylab("Abundance") + xlab("size")
+```
+
+```{r}
+lo95_ts_join_rank <- lo95_ts %>%
+  left_join(max_pred_water, by = "ID_sp") %>% arrange(desc(max_water))
+
+lo95_ts_by_qtile <- lo95_ts %>%
+  left_join(max_pred_water, by = "ID_sp") %>%
+  group_by(x_new, qtile) %>%
+  dplyr::select(x_new, y_span95_corr, qtile) %>%
+  summarise(sum_water = sum(y_span95_corr))
+
+lo95_ts_join_rank %>%
+  ggplot(aes(x = x_new, y = y_span95_corr, group = ID_sp)) +
+  geom_line(aes(col = qtile), alpha = 0.25) +
+  facet_wrap(vars(qtile), scales = "free")
+
+lo95_ts_by_qtile %>%
+  ggplot(aes(x = x_new, y = sum_water, group = qtile)) +
+  geom_line(aes(col = qtile)) +
+  theme_bw()
+```
+
+
+
+
+
+OLD
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+mgcv::gam(water_m2 ~ s(study_days), method = "REML", data = rf_predicts_list_forgam_filtered[[1]])
+
+rf_predicts_list_forgam_filtered %>% 
+  purrr::map_int(~nrow(.x)) %>% hist()
+  
+rf_predicts_list_forgam_filtered[[1]] %>%
+  ggplot(aes(x = study_days, y = water_m2)) +
+  # geom_smooth(method = "loess", span = 0.5) +
+  # geom_smooth(method = "loess", span = 0.25, col = "red", se = FALSE) +
+  geom_smooth(method = "loess", span = 0.75, col = "purple", se = TRUE) +
+  # geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"))
+  geom_point() +
+  scale_y_log10()
+  # coord_cartesian(ylim= c(0, max(rf_predicts_list_forgam_filtered[[3]][["water_m2"]])))
+  # geom_line()
+
+rf_predict_gams_list <- purrr::map(rf_predicts_list_forgam_filtered, 
+                                   ~mgcv::gam(water_m2 ~ s(study_days, fx = FALSE),
+                                               method = "REML", data = .x))
+ # run gam
+  gam_y <- mgcv::gam(jlwater_m2 ~ s(study_days, fx = FALSE, k = -1), 
+                   method = "REML", 
+                   data = mywetland_ts)
+
+  x_new <- 1:365
+  y_pred <- predict(gam_y, data.frame(study_days = x_new), 
+                  se.fit = TRUE)
+  predicts <- data.frame(x_new,
+                       y_pred = y_pred$fit,
+                       y_pred_se = y_pred$se.fit,
+                       stringsAsFactors = FALSE)
+```
+
+
+
+Get a table of image dates and how many days since 2017-10-01
+
+```{r}
+study_days_df <- fw_ts_wdate %>% 
+  dplyr::summarise(imgDates = unique(imgDate)) %>%
+  dplyr::select(-imgDates) %>%
+  mutate(study_interval = interval(ymd("2017-10-01"), ymd(imgDate)),
+         study_days = study_interval/duration(days = 1)) %>%
+  dplyr::select(-study_interval)
+```
+
+```{r}
+jl_area_ts <- fw_ts_wdate %>% 
+  dplyr::filter(ID_sp %in% polygons_for_ts) %>%
+  group_by(imgDate, ID_sp) %>%
+  dplyr::summarise(jlwater_m2 = sum(meanwater)*9) %>%
+  left_join(study_days_df) %>%
+  arrange(ID_sp)
+
+head(jl_area_ts)
+range(jl_area_ts$study_days)
+# interval(ymd("2017-10-01"), ymd("2018-09-30"))/ddays(1)
+```
+
+# Predictions
+
+For each ID_sp, filter and save time series data in results/wetland-time-series, then create a data frame with predictions from gam, saved in results/gams
+
+```{r}
+wetland_ids <- unique(jl_area_ts$ID_sp)
+wetland_id <- wetland_ids[22]
+predict_method <- "SVM"
+
+dep_id_m2 <- dplyr::filter(mvdepressions_df, dep_id == wetland_id) %>% pull(ha)*10000
+```
+
+```{r}
+jl_area_ts
+mvdepressions_df
+
+save_wetarea_gam <- function(wetland_id){
+  # static area of depression
+  wetland_id_lp <- str_pad(wetland_id, 5, pad = "0")
+  dep_id_m2 <- dplyr::filter(mvdepressions_df, 
+                             dep_id == wetland_id_lp) %>% pull(ha)*10000
+
+  # save single time series from jl_area_ts
+    ts_filename <- paste0("/nfs/khondula-data/planetmethane/results/wetland-time-series/dep_id-", stringr::str_pad(wetland_id, 5, pad = "0"), "_", predict_method, "-timeseries.csv")
+
+  mywetland_ts <- jl_area_ts %>%
+    filter(ID_sp == wetland_id)
+  write_csv(mywetland_ts, ts_filename)
+  
+  # run gam
+  gam_y <- mgcv::gam(jlwater_m2 ~ s(study_days, fx = FALSE, k = -1), 
+                   method = "REML", 
+                   data = mywetland_ts)
+
+  x_new <- 1:365
+  y_pred <- predict(gam_y, data.frame(study_days = x_new), 
+                  se.fit = TRUE)
+  predicts <- data.frame(x_new,
+                       y_pred = y_pred$fit,
+                       y_pred_se = y_pred$se.fit,
+                       stringsAsFactors = FALSE)
+  
+  # save predictions df
+  predicts_adj <- predicts %>%
+  mutate(y_pred_pos_m2 = case_when(y_pred < 0 ~ 0, y_pred >= 0 ~ y_pred)) %>%
+  mutate(dep_id = stringr::str_pad(wetland_id, 5, pad = "0")) %>%
+  mutate(predict_date = seq.Date(from = as.Date("2017-10-01"), 
+                                 to = as.Date("2018-09-30"), 
+                                 by = "day"))
+
+  predicts_filename <- paste0("/nfs/khondula-data/planetmethane/results/gams/dep_id-", stringr::str_pad(wetland_id, 5, pad = "0"), "_", 
+                            predict_method, "-gam.csv")
+
+write_csv(predicts_adj, predicts_filename)
+
+# save plot of area
+p1 <- ggplot(predicts_adj, aes(predict_date, y_pred_pos_m2)) + 
+  geom_line(size = 1, col = "orange") + 
+  geom_hline(yintercept = dep_id_m2, col = "black", lty = 3) +
+  geom_line(size = 0.5, col = "orange", lty = 2,
+            aes(y = y_pred_pos_m2 + y_pred_se)) + 
+  geom_line(size = 0.5, col = "orange", lty = 2,
+            aes(y = y_pred_pos_m2 - y_pred_se)) +
+  geom_point(data = mywetland_ts, col = "dodgerblue",
+             aes(imgDate, jlwater_m2)) +
+  theme_bw() +
+  ylab("Surface water area (m2)") +
+  xlab(element_blank())
+
+  figfilename <- paste0("/nfs/khondula-data/planetmethane/results/gams-figs/",
+                        wetland_id, ".png")
+  png(figfilename, width = 500, height = 300)
+  print(p1)
+  dev.off()
+}
+```
+
+```{r}
+save_wetarea_gam(wetland_id = "9634")
+purrr::walk(wetland_ids, ~save_wetarea_gam(.x))
+```
+
+
+OLD/one at a time
+```{r}
+
+ts_filename <- paste0("/nfs/khondula-data/planetmethane/results/wetland-time-series/dep_id-", stringr::str_pad(wetland_id, 5, pad = "0"), "_", predict_method, "-timeseries.csv")
+
+mywetland_ts <- jl_area_ts %>%
+  filter(ID_sp == wetland_id)
+write_csv(mywetland_ts, ts_filename)
+
+gam_y <- mgcv::gam(jlwater_m2 ~ s(study_days, fx = FALSE, k = -1), 
+                   method = "REML", 
+                   # family = ziP(theta = NULL, link = "identity",b=0),
+                   data = mywetland_ts)
+
+summary(gam_y)
+x_new <- 1:365
+y_pred <- predict(gam_y, data.frame(study_days = x_new), 
+                  se.fit = TRUE)
+predicts <- data.frame(x_new,
+                       y_pred = y_pred$fit,
+                       y_pred_se = y_pred$se.fit,
+                       stringsAsFactors = FALSE)
+```
+
+```{r}
+ggplot(mywetland_ts, aes(study_days, jlwater_m2)) + 
+  # geom_smooth(method = "gam", formula = y ~s(x)) +
+  geom_line(data = predicts, aes(x = x_new, y = y_pred),
+     size = 1, color = "orange") + 
+    geom_line(data = predicts, aes(x = x_new, y = y_pred+y_pred_se),
+     size = 0.5, color = "orange", lty = 2) +   
+  geom_line(data = predicts, aes(x = x_new, y = y_pred-y_pred_se),
+     size = 0.5, color = "orange", lty = 2) + 
+  geom_point(pch = 21, fill = "dodgerblue", size = 2) +
+  theme_bw()
+```
+
+```{r}
+predicts_adj <- predicts %>%
+  mutate(y_pred_pos_m2 = case_when(y_pred < 0 ~ 0, y_pred >= 0 ~ y_pred)) %>%
+  mutate(dep_id = stringr::str_pad(wetland_id, 5, pad = "0")) %>%
+  mutate(predict_date = seq.Date(from = as.Date("2017-10-01"), 
+                                 to = as.Date("2018-09-30"), 
+                                 by = "day"))
+
+predicts_filename <- paste0("/nfs/khondula-data/planetmethane/results/gams/dep_id-", stringr::str_pad(wetland_id, 5, pad = "0"), "_", 
+                            predict_method, "-gam.csv")
+
+write_csv(predicts_adj, predicts_filename)
+
+```
+
+```{r}
+ggplot(predicts_adj, aes(predict_date, y_pred_pos_m2)) + 
+  geom_line(size = 1, col = "orange") + 
+  geom_hline(yintercept = dep_id_m2, col = "black", lty = 3) +
+  geom_line(size = 0.5, col = "orange", lty = 2,
+            aes(y = y_pred_pos_m2 + y_pred_se)) + 
+  geom_line(size = 0.5, col = "orange", lty = 2,
+            aes(y = y_pred_pos_m2 - y_pred_se)) +
+  geom_point(data = mywetland_ts, col = "dodgerblue",
+             aes(imgDate, jlwater_m2)) +
+  theme_bw() +
+  ylab("Surface water area (m2)") +
+  xlab(element_blank())
+```
+
+old below here
+
+```{r}
+gam_y <- mgcv::gam(jlwater_ha ~ s(study_days, fx = FALSE, k = -1), 
+                   method = "REML", data = jl_area_ts)
+```
+
+```{r}
+x_new <- 1:365
+y_pred <- predict(gam_y, data.frame(study_days = x_new), 
+                  se.fit = TRUE)
+predicts <- data.frame(x_new, y_pred = y_pred$fit,
+                       y_pred_se = y_pred$se.fit,
+                       stringsAsFactors = FALSE)
+```
+
+```{r}
+par(mfrow = c(2,2))
+gam.check(gam_y)
+```
+
+
+```{r}
+ggplot(jl_area_ts, aes(study_days, jlwater_ha)) + 
+  # geom_smooth(method = "gam", formula = y ~s(x)) +
+  geom_line(data = predicts, aes(x = x_new, y = y_pred),
+     size = 1, color = "orange") + 
+    geom_line(data = predicts, aes(x = x_new, y = y_pred+y_pred_se),
+     size = 0.5, color = "orange", lty = 2) +   
+  geom_line(data = predicts, aes(x = x_new, y = y_pred-y_pred_se),
+     size = 0.5, color = "orange", lty = 2) + 
+  geom_point(pch = 21, fill = "dodgerblue", size = 2) +
+  theme_bw()
+```
+
+
+```{r}
+ggplot(mywetland_ts, aes(study_days, jlwater_m2)) + 
+  geom_smooth(method = "gam", formula = y ~s(x)) +
+  geom_point(pch = 21, size = 2, fill = "orange") + 
+  theme_bw()
+```
+

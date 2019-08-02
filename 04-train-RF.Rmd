@@ -1,0 +1,525 @@
+---
+title: "Train RF"
+author: "Kelly Hondula"
+date: "5/15/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ranger)
+library(caret)
+library(raster)
+library(rasterVis)
+library(data.table)
+# library(tabularaster)
+library(readr)
+library(ggplot2)
+library(stringr)
+library(fs)
+library(tidyr)
+library(dplyr)
+library(e1071)
+
+data_dir <- "/nfs/khondula-data/planetmethane"
+
+```
+
+Read in data for an image
+```{r}
+allbands_extracted_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract/")
+allbands_extracted_file <- grep("20180324_151503_1024", allbands_extracted_files, value = TRUE) %>% as.vector()
+allbands_extracted_files_mvdeps <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract-mvdeps/")
+allbands_extracted_file_mvdeps <- grep("20180324_151503_1024", allbands_extracted_files_mvdeps, value = TRUE) %>% as.vector()
+# allbands_extracted_file <- allbands_extracted_files[2]
+img_extract_data <- data.table::fread(allbands_extracted_file) %>% as.data.frame()
+head(img_extract_data)
+thisimgID <- img_extract_data$imgID[1]
+```
+
+Construct the training data set for the image
+
+* water pixels as everything below the median NIR value and above median NDWI value
+* random selection of equal number of upland pixels
+
+```{r}
+thisimgID <- img_extract_data$imgID[1]
+
+median_nir <- img_extract_data %>% 
+  filter(trainclass == "water") %>% 
+  pull(b4_NIR) %>% median()
+median_ndwi <- img_extract_data %>% 
+  filter(trainclass == "water") %>% 
+  pull(NDWI) %>% median()
+train_water <- img_extract_data %>% 
+  filter(trainclass == "water", b4_NIR < median_nir & NDWI > median_ndwi)
+train_water_nrow <- nrow(train_water)
+train_water_nrow
+train_uplan <- img_extract_data %>% 
+  filter(trainclass == "uplan") %>% 
+  dplyr::sample_n(size = train_water_nrow)
+img_extract_data_rf <- rbind(train_water, train_uplan) %>% 
+  dplyr::select(-ID_sp, -imgID)
+```
+
+Using ranger
+```{r}
+# predictors
+features <- setdiff(names(img_extract_data_rf), "trainclass")
+# run model
+rf1 <- ranger(
+  formula = trainclass ~ .,
+  data = img_extract_data_rf,
+  num.trees = 1000,
+  mtry = floor(length(features)/3),
+  min.node.size = 5,
+  importance = 'impurity'
+)
+rf1
+rf1$confusion.matrix
+rf1$prediction.error
+
+rf1$variable.importance %>%
+  broom::tidy() %>%
+  dplyr::arrange(desc(x)) %>%
+  ggplot(aes(reorder(names, x), x)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw()
+```
+
+```{r}
+# fit a random forest model (using ranger, via caret)
+rf_fit <- train(as.factor(trainclass) ~ ., 
+                data = img_extract_data_rf, 
+                method = "ranger")
+rf_fit
+```
+
+```{r}
+# define a grid of parameter options to try
+rf_grid <- expand.grid(mtry = c(2:7),
+                      splitrule = c("gini", "extratrees"),
+                      min.node.size = c(1, 3, 5))
+rf_grid
+```
+
+```{r}
+library(ranger)
+library(caret)
+# re-fit the model with the parameter grid
+rf_fit <- train(as.factor(trainclass) ~ ., 
+                data = img_extract_data_rf, 
+                method = "ranger",
+                # trControl = group_fit_control,
+                # provide a grid of parameters
+                tuneGrid = rf_grid)
+rf_fit %>% str()
+rf_fit %>% plot()
+```
+
+```{r}
+masked_layer_files
+r_stack <- grep("20180324_151503_1024", masked_layer_files, value = TRUE) %>% raster::stack()
+names(r_stack) <- band_names
+r_stack$b4_NIR %>% plot()
+
+img_extract_narm <- read_csv(allbands_extracted_file_mvdeps)
+# predict the outcome on new data
+water_rf_pred <- predict(rf1, img_extract_narm)
+# compare predicted outcome and true outcome
+img_extract_narm$ranger_predict <- water_rf_pred$predictions # ranger
+# img_extract_narm$ranger_predict <- water_rf_pred %>% as.character() # caret
+head(img_extract_narm)
+img_extract_predicts <- img_extract_narm %>% group_by(ID_sp, ranger_predict) %>% dplyr::select(ID_sp, ranger_predict) %>% table()
+img_extract_predicts <- img_extract_predicts %>% as.data.frame() %>% tidyr::spread(ranger_predict, Freq) %>%
+  arrange(desc(water))
+
+img_extract_predicts %>% dplyr::filter(ID_sp %in% c("09829", "10097", "10162", "10112", "09845",
+                             "09697", "10002", "09634", "10164"))
+
+img_extract_predicts %>% pull(ID_sp) %>% sort() %>% unique()
+# confusionMatrix(water_rf_pred, as.factor(water_rf_pred$trainclass))
+```
+
+```{r}
+training_ids <- substr(basename(fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract/")), 1, 20)
+# training_ids <- substr(basename(training_files), 1, 20)
+# mvdeps_data_ids <- substr(basename(fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract-mvdeps/")), 1, 20)
+# training_ids %in% mvdeps_data_ids
+img_id <- imgs_wo_rfmodels[1]
+img_id <- "20171111_155114_0f4d"
+img_id <- training_ids[6]
+# data.frame(ID_sp = nwi_inNLCD) %>% write_csv("/nfs/khondula-data/planetmethane/results/nwi_inNLCD.csv")
+
+run_rf_for_imgid <- function(img_id, predict_new_vals = FALSE){
+  data_dir <- "/nfs/khondula-data/planetmethane"
+
+  # read in training data
+  # training_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract/")
+  # training_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract_cellIDs/")
+  training_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract_spIDs/")
+  # mvdeps_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract_cellIDs/")
+
+  training_file <- grep(img_id, training_files, value = TRUE) %>% as.vector()
+  # mvdeps_file <- grep(img_id, mvdeps_files, value = TRUE) %>% as.vector()
+  
+  # head(read_csv(training_file2))
+  img_extract_data <- data.table::fread(training_file) %>% 
+    as.data.frame() %>% 
+    dplyr::select(-HUE, -HUE2, -VAL) %>% # exclude these predictors
+    dplyr::filter(ID_sp != "upland5") # exclude emergent herbaceous wetlands
+  
+  thisimgID <- img_extract_data$imgID[1]
+
+  # construct training data set
+  nwi_inNLCD <- readr::read_csv("/nfs/khondula-data/planetmethane/results/nwi_inNLCD.csv") %>% pull(ID_sp)
+  train_water_nrow <- img_extract_data %>% dplyr::filter(ID_sp %in% nwi_inNLCD) %>% nrow()
+
+  rf_meta <- data.frame('imgID' = thisimgID, 'water_training_pix' = train_water_nrow)
+    meta_files_dir <- file.path(data_dir, "results/rf_meta/noEHW_v2")
+    if(!fs::dir_exists(meta_files_dir)){fs::dir_create(meta_files_dir)}
+  meta_filename <- file.path(meta_files_dir, sprintf("%s.rds", thisimgID))
+  readr::write_csv(rf_meta, meta_filename)
+  
+  if(train_water_nrow > 0){
+    
+  train_water <- img_extract_data %>% 
+    dplyr::filter(ID_sp %in% nwi_inNLCD) %>%
+    dplyr::sample_n(size = train_water_nrow*(2/3))
+  train_uplan <- img_extract_data %>%
+    filter(trainclass == "uplan") %>% 
+    dplyr::sample_n(size = train_water_nrow*(2/3))
+  
+  img_extract_data_rf <- rbind(train_water, train_uplan) %>% 
+    dplyr::select(-ID_sp, -imgID) %>% na.omit()
+  
+  n_features <- length(setdiff(names(img_extract_data_rf), "trainclass"))
+
+  # ranger model
+  # rf1 <- ranger(
+  #   formula = trainclass ~ .,
+  #   data = img_extract_data_rf,
+  #   num.trees = 5000,
+  #   mtry = floor(2/3 * n_features),
+  #   # mtry = floor(sqrt(n_features)), #default recommendations for classification is sqrt
+  #   min.node.size = 1, #default recommendations for classification
+  #   importance = 'impurity')
+  
+  # caret model training
+  # define a grid of parameter options to try
+  rf_grid <- expand.grid(mtry = c(2:7),
+                      splitrule = c("gini", "extratrees"), # only extratrees but also a lot of blanks?
+                      min.node.size = c(1, 3, 5)) # 1, 3 and 5
+  rf1 <- train(as.factor(trainclass) ~ ., 
+                data = img_extract_data_rf, 
+               num.trees = 1000,
+                method = "ranger",
+               importance = 'permutation',
+                # trControl = group_fit_control,
+                # provide a grid of parameters
+                tuneGrid = rf_grid)
+  
+  model_files_dir <- file.path(data_dir, "results/rf_model_files/noEHW_v2")
+    if(!fs::dir_exists(model_files_dir)){fs::dir_create(model_files_dir)}
+
+  model_filename <- file.path(model_files_dir, sprintf("%s.rds", thisimgID))
+  rf1 %>% saveRDS(file = model_filename)
+  
+  # img_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/masked-cropJL")
+  # img_file <- grep(thisimgID, as.vector(img_files), value = TRUE)
+  # 
+  # if(length(img_file)>0){
+  #   r_img <- raster::stack(img_file)
+  #   names(r_img) <- c("b1_blue", "b2_green", "b3_red", "b4_NIR", "NDWI", "NDVI")  
+  #   r_img_df <- r_img %>% tabularaster::as_tibble()
+  #   r_img_df_spread <- r_img_df %>% tidyr::spread(dimindex, cellvalue)
+  #   names(r_img_df_spread)[2:7] <- c("b1_blue", "b2_green", "b3_red", "b4_NIR", "NDWI", "NDVI")  
+  #   r_img_df_narm <- dplyr::filter(r_img_df_spread, !is.na(NDWI)) %>% as.data.frame()
+  #   
+  #   hsvvals <- rgb2hsv(r = r_img_df_narm[,"b3_red"],
+  #                  g = r_img_df_narm[,"b2_green"], 
+  #                  b = r_img_df_narm[,"b1_blue"], 
+  #                  maxColorValue = max(r_img_df_narm$b3_red, r_img_df_narm$b2_green, r_img_df_narm$b1_blue))
+  #   
+  #   hsv_df <- hsvvals %>% t() %>% as.data.frame() %>% 
+  #     dplyr::mutate(cellid = r_img_df_narm$cellindex)
+  #   
+  #   labvals <- colorspace::RGB(r_img_df_narm[,"b3_red"], 
+  #                          r_img_df_narm[,"b2_green"],
+  #                          r_img_df_narm[,"b1_blue"]) %>% as("polarLAB")
+  #   
+  #   labvals_df <- labvals@coords %>% as.data.frame() %>% mutate(cellid = r_img_df_narm$cellindex)
+  #   colmetrics_df <- r_img_df_narm %>% 
+  #     left_join(hsv_df, by = c("cellindex" = "cellid")) %>% 
+  #     left_join(labvals_df, by = c("cellindex" = "cellid"))
+  #   
+  #   img_vals_for_model <- colmetrics_df %>% rename(HUE = h,
+  #                        SAT = s,
+  #                        VAL = v,
+  #                        LUM = L,
+  #                        CHROMA = C,
+  #                        HUE2 = H) %>% as.data.frame()
+  #   
+  #   pred_ranger <- rf1 %>% predict(img_vals_for_model)
+  #   
+  #   img_vals_for_model$rangerclass <- pred_ranger$predictions
+  #   
+  #   img_vals_predicts <- data.frame(cellindex = 1:ncell(r_img)) %>% left_join(img_vals_for_model)
+  #   r_img$rangerclass <- img_vals_predicts$rangerclass
+  #   
+  #   p1 <- rasterVis::levelplot(r_img$rangerclass,
+  #                    main = thisimgID, margin = FALSE,
+  #                    col.regions = c("green", "blue"))
+  #   
+  #   pfilename <- file.path(data_dir, sprintf("results/rf-maps/noval/%s.png", thisimgID))
+  #   png(pfilename, width = 1000, height = 1000)
+  #   print(p1)
+  #   dev.off()
+  # 
+  #   }
+    if(predict_new_vals == TRUE){
+
+  # read in mvdeps band data
+  cells_extract_dir <- file.path(data_dir, "results", "masked-allbands-extract_cellids")
+  allbands_extracted_files_mvdeps <- fs::dir_ls(cells_extract_dir)
+  allbands_extracted_file_mvdeps <- grep(img_id, allbands_extracted_files_mvdeps, value = TRUE) %>% as.vector()
+  img_extract_narm <- data.table::fread(allbands_extracted_file_mvdeps) %>% as.data.frame()
+  img_extract_narm <- img_extract_narm %>% dplyr::filter(mvdeps)
+  
+  # read in table for this image with cell numbers for each polygon for grouping
+  mvdeps_cellno_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/metadata/mvdeps_cellnos")
+  mvdeps_cellno_file <- grep(img_id, mvdeps_cellno_files, value = TRUE)
+  mvdeps_cellnos <- readr::read_csv(mvdeps_cellno_file) %>% 
+    mutate(ID_sp = stringr::str_pad(object_, width = 5, side = "left", pad = "0")) %>%
+    rename(cellindex = cell_) %>% dplyr::select(-object_)
+  img_extract_narm <- img_extract_narm %>% left_join(mvdeps_cellnos, by = c("cellindex"))
+  # masked_layer_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/udm_masked_allbands")
+  # masked_layer_file <- grep(img_id, masked_layer_files, value = TRUE) %>% as.vector()
+  # 
+  # img_allbands <- raster::stack(masked_layer_file)
+  # img_allbands_df <- tabularaster::as_tibble(img_allbands)
+  # r_img_df_spread <- img_allbands_df %>% tidyr::spread(dimindex, cellvalue)
+  # rm(img_allbands_df)
+  # 
+  # names(r_img_df_spread)[2:13] <-c("b1_blue", "b2_green", "b3_red", "b4_NIR",
+  #               "NDVI", "NDWI", "HUE", "SAT", "VAL", "LUM", "CHROMA", "HUE2")
+  # # correct NDVI issue and filter NAs
+  # 
+  # r_img_df_narm <- dplyr::filter(r_img_df_spread, !is.na(NDWI)) %>% 
+  #   mutate(NDVI = (b4_NIR - b3_red)/(b4_NIR + b3_red)) %>%
+  #   as.data.frame()
+  #   
+  # pred_ranger <- rf1 %>% predict(r_img_df_narm)
+  #   
+  # r_img_df_narm$rangerclass <- pred_ranger$predictions
+  #   
+  # img_vals_predicts <- data.frame(cellindex = 1:ncell(r_img)) %>% left_join(img_vals_for_model)
+  # img_allbands$rangerclass <- img_vals_predicts$rangerclass
+  #   
+  # save raster, image, and do extractions
+  
+  # predict the outcome on new data
+    
+  water_rf_pred <- predict(rf1, img_extract_narm)
+  
+  # img_extract_narm$ranger_predict <- water_rf_pred$predictions # ranger
+  img_extract_narm$ranger_predict <- water_rf_pred # caret
+  img_extract_predicts <- img_extract_narm %>% group_by(ID_sp, ranger_predict) %>% 
+    dplyr::select(ID_sp, ranger_predict) %>% table()
+  
+  img_extract_predicts <- img_extract_predicts %>% as.data.frame() %>% 
+    tidyr::spread(ranger_predict, Freq) %>%
+    arrange(desc(water))
+  
+  results2_dir <- "/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels"
+  if(!fs::dir_exists(results2_dir)){fs::dir_create(results2_dir)}
+   img_extract_narm %>% 
+     write_csv(file.path(results2_dir, sprintf("rfpredict_%s.csv", thisimgID)))    
+   
+  results_dir <- "/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW"
+  if(!fs::dir_exists(results_dir)){fs::dir_create(results_dir)}
+   img_extract_predicts %>% 
+     write_csv(file.path(results_dir, sprintf("rfpredict_%s.csv", thisimgID)))    
+  }
+
+}
+}
+```
+
+```{r}
+training_ids <- substr(basename(fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract_spIDs/")), 1, 20)
+training_ids <- substr(basename(fs::dir_ls("/nfs/khondula-data/planetmethane/imgs_for_analysis/")), 1, 20)
+
+imgs_w_rfmodels <- substr(basename(fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels_v2//")), 11, 30)
+allbands_extracted <- substr(basename(fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract_spIDs/")), 1, 20)
+message(paste(length(allbands_extracted), "polygon extractions"))
+message(paste(length(imgs_w_rfmodels), "images with RF models"))
+
+
+imgs_wo_rfmodels <- allbands_extracted[!allbands_extracted %in% imgs_w_rfmodels]
+message(paste(length(imgs_wo_rfmodels), "images with extracted valus but no RF model"))
+
+# run_rf_for_imgid(img_id = training_ids[3])
+# run_rf_for_imgid(img_id = "20171120_150953_0f12")
+# 
+# purrr::walk(training_ids[2:10], ~run_rf_for_imgid(.x))
+# purrr::walk(training_ids[11:17], ~run_rf_for_imgid(.x))
+# purrr::walk(training_ids[18:36], ~run_rf_for_imgid(.x))
+# purrr::walk(training_ids[37:57], ~run_rf_for_imgid(.x))
+# purrr::walk(training_ids[58:77], ~run_rf_for_imgid(.x))
+# purrr::walk(training_ids[78:97], ~run_rf_for_imgid(.x))
+# purrr::walk(training_ids[98:127], ~run_rf_for_imgid(.x))
+# purrr::walk(training_ids[128:147], ~run_rf_for_imgid(.x))
+# purrr::walk(training_ids[148:162], ~run_rf_for_imgid(.x))
+```
+
+```{r}
+library(rslurm)
+# training_ids_running <- training_ids
+# new_imgs_forrf <- imgs_wo_rfmodels[imgs_wo_rfmodels %in% complete_cellnos_imgs]
+
+pars <- data.frame(img_id = imgs_wo_rfmodels[2:4], predict_new_vals = FALSE,
+                     # training_ids,
+                   stringsAsFactors = FALSE)
+
+sjobrf6 <- rslurm::slurm_apply(run_rf_for_imgid, 
+                               pars, 
+                            jobname = "rf6", 
+                            slurm_options = list(partition = "sesync"),
+                            nodes = 3,
+                            # cpus_per_node = 1,
+                            submit = TRUE)
+
+rslurm::print_job_status(sjobrf5)
+rslurm::print_job_status(sjobrf6)
+rslurm::print_job_status(sjobrf4)
+length(list.files("/nfs/khondula-data/planetmethane/results/rf_model_files/noEHW_v2"))
+# 
+# rslurm::cancel_slurm(sjobrf4)
+```
+
+# RF PREDICTIONS
+
+```{r}
+thisimgID <- "20171228_154351_0f3d" # was bad
+thisimgID <- "20180618_151353_1024" # completed cellnos extract
+thisimgID <- "20171006_155634_104e"
+thisimgID <- imgs_wo_rfmodels[1]
+library(fs)
+library(data.table)
+library(readr)
+library(dplyr)
+library(ranger)
+library(caret)
+library(purrr)
+library(tidyr)
+
+predict_rf_for_img <- function(thisimgID){
+  data_dir <- "/nfs/khondula-data/planetmethane"
+
+  img_id <- thisimgID
+  model_files_dir <- file.path(data_dir, "results/rf_model_files/noEHW")
+  model_filename <- file.path(model_files_dir, sprintf("%s.rds", thisimgID))
+  rf1 <- readRDS(file = model_filename)
+
+ # read in mvdeps band data
+  cells_extract_dir <- file.path(data_dir, "results", "masked-allbands-extract_cellids")
+  allbands_extracted_files_mvdeps <- fs::dir_ls(cells_extract_dir)
+  allbands_extracted_file_mvdeps <- grep(img_id, allbands_extracted_files_mvdeps, value = TRUE) %>% as.vector()
+  img_extract_narm <- data.table::fread(allbands_extracted_file_mvdeps) %>% as.data.frame()
+  img_extract_narm <- img_extract_narm %>% dplyr::filter(mvdeps)
+  
+  # read in table for this image with cell numbers for each polygon for grouping
+  mvdeps_cellno_dir <- sprintf("/nfs/khondula-data/planetmethane/metadata/mvdeps_cellnos2/%s", thisimgID)
+  mvdeps_cellno_files <- list.files(mvdeps_cellno_dir, full.names = TRUE)
+  img_cellnos_list <- mvdeps_cellno_files %>%
+    purrr::map(~readr::read_csv(.x, col_types = c("dd")))
+  names(img_cellnos_list) <- substr(basename(mvdeps_cellno_files), 8, 12)
+  img_cellnos <- bind_rows(img_cellnos_list, .id = "ID_sp") %>% dplyr::select(-object_)
+  
+  img_extract_narm <- img_extract_narm %>% 
+    dplyr::left_join(img_cellnos, by = c("cellindex" = "cell_"))
+
+  img_extract_narm <- na.omit(img_extract_narm)
+ # predict the outcome on new data
+  water_rf_pred <- predict(rf1, img_extract_narm)
+  
+  if(length(water_rf_pred)==nrow(img_extract_narm)){
+    img_extract_narm$ranger_predict <- water_rf_pred # caret
+  } 
+  if(length(water_rf_pred)!=nrow(img_extract_narm)){
+    img_extract_narm$ranger_predict <- water_rf_pred$predictions # ranger
+  }
+  
+  # img_extract_narm$ranger_predict <- water_rf_pred$predictions # ranger
+  img_extract_predicts <- img_extract_narm %>% group_by(ID_sp, ranger_predict) %>% 
+    dplyr::select(ID_sp, ranger_predict) %>% table()
+  
+  img_extract_predicts <- img_extract_predicts %>% as.data.frame() %>% 
+    tidyr::spread(ranger_predict, Freq) %>%
+    arrange(desc(water))
+  
+  results2_dir <- "/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels_v2"
+  if(!fs::dir_exists(results2_dir)){fs::dir_create(results2_dir)}
+   img_extract_narm %>% 
+     write_csv(file.path(results2_dir, sprintf("rfpredict_%s.csv", thisimgID)))    
+   
+  results_dir <- "/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_v2"
+  if(!fs::dir_exists(results_dir)){fs::dir_create(results_dir)}
+   img_extract_predicts %>% 
+     write_csv(file.path(results_dir, sprintf("rfpredict_%s.csv", thisimgID)))    
+  }
+
+```
+
+```{r}
+predict_rf_for_img(thisimgID = "20180828_152007_1009")
+purrr::walk(new_complete_cellsnos[1:5], ~predict_rf_for_img(.x))
+```
+
+```{r}
+imgs_w_rfmodels <- substr(basename(fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_model_files/noEHW_v2/")), 1, 20)
+
+# allbands_extracted <- substr(basename(fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract_spIDs/")), 1, 20)
+# message(paste(length(allbands_extracted), "polygon extractions"))
+# message(paste(length(imgs_w_rfmodels), "images with RF models"))
+imgs_wrf_predicts <- substr(basename(fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_v2/")), 11, 30)
+
+# imgs_wo_rfmodels <- allbands_extracted[!allbands_extracted %in% imgs_w_rfmodels]
+# message(paste(length(imgs_wo_rfmodels), "images with extracted valus but no RF model"))
+
+imgs_for_rf <- imgs_w_rfmodels[!imgs_w_rfmodels %in% imgs_wrf_predicts]
+message(paste(length(imgs_for_rf), "images with RF trained but not predicted"))
+```
+
+```{r}
+library(rslurm)
+
+pars <- data.frame(thisimgID = imgs_for_rf,
+                     # training_ids,
+                   stringsAsFactors = FALSE)
+
+sjobrfp <- rslurm::slurm_apply(predict_rf_for_img, 
+                               pars, 
+                            jobname = "rfpred", 
+                            slurm_options = list(partition = "sesync", time = "1:00:00"),
+                            nodes = 2,
+                            cpus_per_node = 2,
+                            submit = TRUE)
+
+rslurm::print_job_status(sjobrfp)
+
+length(list.files("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_v2/"))
+# 
+# rslurm::cancel_slurm(sjobrfp)
+```
+
+```{r}
+imgs_w_rfmodels %>% as.data.frame() %>%
+  write_csv("imgs_w_rf_models.csv")
+```
+
