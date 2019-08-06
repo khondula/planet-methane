@@ -43,7 +43,8 @@ udms <- data.frame("udm_id_20" = my_udms,
                    "udm_full_id" = basename(list.files('data/metadata/download_udm')),
                    stringsAsFactors = FALSE)
 imgs_masked <-  data.frame("udm_masked" =
-                      tools::file_path_sans_ext(basename(list.files('data/udm_masked_imgs/'))), 
+                      tools::file_path_sans_ext(basename(
+                        list.files('data/udm_masked_imgs/', pattern = ".gri"))), 
                       stringsAsFactors = FALSE)
 imgs_bands_added <- data.frame("bands_added" =
                       tools::file_path_sans_ext(basename(list.files('data/imgs_for_analysis/'))), 
@@ -51,7 +52,7 @@ imgs_bands_added <- data.frame("bands_added" =
 
 
 imgs %>% 
-  left_join(udms, by = c('img_id_20' = 'udm_id_20')) %>%
+  full_join(udms, by = c('img_id_20' = 'udm_id_20')) %>%
   mutate(udm_masked = img_id_20 %in% imgs_masked$udm_masked,
          bands_added = img_id_20 %in% imgs_bands_added$bands_added) %>% 
   arrange(img_id_20) %>% 
@@ -144,9 +145,9 @@ Update image metadata file!
 
 ```{r}
 img_metadata_df <- readr::read_csv("data/img_metadata_df.csv")
-imgs_addbands <- img_metadata_df %>% 
-  filter(cloud_cover >=0.01 & cloud_cover < 0.1) %>% 
-  arrange(desc(cloud_cover)) %>% 
+imgs_addbands <- img_metadata_df %>%
+  filter(cloud_cover >=0.01 & cloud_cover < 0.1) %>%
+  arrange(desc(cloud_cover)) %>%
   pull(imgID)
 
 imgs_metadata_issues <- img_metadata_df %>%
@@ -157,7 +158,6 @@ needbands_files <- needbands_files[!needbands_ids %in% imgs_metadata_issues]
 needbands_ids <- substr(basename(needbands_files), 1, 20)
 needbands_ids
 message(paste(length(needbands_ids), "masked images without bands added and without metadata issues"))
-message(paste(length(masked_layer_ids), "masked images without bands added and without metadata issues"))
 ```
 
 

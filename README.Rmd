@@ -13,7 +13,7 @@ Processing PlanetScope Surface Reflectance data to develop a daily time series a
 
 #### Inputs
 
-* downloaded analytic surface reflectance images in **data** folder (n = 320)
+* downloaded analytic surface reflectance images in **data** folder (n = `r length(list.files("data/data"))`)
 * downloaded unusable data masks in **metadata/download_udm** folder
 
 #### Steps
@@ -21,11 +21,11 @@ Processing PlanetScope Surface Reflectance data to develop a daily time series a
 * applies UDM to images with function `apply_udm_mask`, saved in * **udm_masked_imgs**
 * calculates new layers: NDVI, NDWI, Hue, Saturation, Value, Chroma, Lum, Hue2
 
-*table with metrics, definition, function/package*
+*add in table with metrics, definition, function/package*
 
 #### Outputs
 
-* **imgs_for_analysis** (n = 285) - 12 band rasters saved as geotifs with 20 digit IDs corresponding to first 20 digits of Planet ID. Excludes images with metadata issues (test quality, greater than 10% cloud cover, or visible clouds). 
+* **imgs_for_analysis** (n = `r length(list.files("data/imgs_for_analysis"))`) - 12 band rasters saved as geotifs with 20 digit IDs corresponding to first 20 digits of Planet ID. Excludes images with metadata issues (test quality, greater than 10% cloud cover, or visible clouds). 
 
 ## 02-prep-training
 
