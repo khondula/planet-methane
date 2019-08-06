@@ -11,9 +11,11 @@ library(readr)
 library(fs)
 library(stringr)
 library(dplyr)
+library(colorspace)
 library(sf)
 library(binaryLogic)
 library(sp)
+library(velox)
 library(readr)
 library(dplyr)
 ```
@@ -30,6 +32,30 @@ message(paste(length(myimg_ids), "downloaded SR images"))
 my_udms <- substr(list.files("data/metadata/download_udm"), 1, 20)
 message(paste(length(my_udms), "UDMs"))
 message(paste(sum(!myimg_ids %in% my_udms), "images without UDMs"))
+```
+
+
+```{r, eval = FALSE}
+imgs <- data.frame("img_id_20" = myimg_ids,
+           "full_id" = basename(list.files('data/data')),
+           stringsAsFactors = FALSE)
+udms <- data.frame("udm_id_20" = my_udms,
+                   "udm_full_id" = basename(list.files('data/metadata/download_udm')),
+                   stringsAsFactors = FALSE)
+imgs_masked <-  data.frame("udm_masked" =
+                      tools::file_path_sans_ext(basename(list.files('data/udm_masked_imgs/'))), 
+                      stringsAsFactors = FALSE)
+imgs_bands_added <- data.frame("bands_added" =
+                      tools::file_path_sans_ext(basename(list.files('data/imgs_for_analysis/'))), 
+                      stringsAsFactors = FALSE)
+
+
+imgs %>% 
+  left_join(udms, by = c('img_id_20' = 'udm_id_20')) %>%
+  mutate(udm_masked = img_id_20 %in% imgs_masked$udm_masked,
+         bands_added = img_id_20 %in% imgs_bands_added$bands_added) %>% 
+  arrange(img_id_20) %>% 
+  readr::write_csv('imgs_inventory.csv')
 ```
 
 Mask the image to set all values as NA that are not 0 in the unusable data mask
@@ -70,7 +96,7 @@ apply_udm_mask <- function(imgID){
 Run function locally 
 
 ```{r}
-apply_udm_mask(imgID = imgIDs_to_mask_w_udms[1])
+apply_udm_mask(imgID = imgIDs_to_mask_w_udms[4])
 # purrr::walk(imgIDs_to_mask_w_udms[], ~apply_udm_mask(.x))
 ```
 
@@ -107,11 +133,14 @@ message(paste(length(addbands_ids), "images for analysis with bands added"))
 # needbands_ids <- names(which(masked_layers)) %>% basename() %>% substr(1,20)
 # 
 needbands_files <- masked_imgfiles[!masked_ids %in% addbands_ids]
+
 needbands_ids <- substr(basename(needbands_files), 1, 20)
 needbands_ids
 message(paste(length(needbands_ids), "udm masked images without bands added"))
 
 ```
+
+Update image metadata file! 
 
 ```{r}
 img_metadata_df <- readr::read_csv("data/img_metadata_df.csv")
@@ -129,13 +158,12 @@ needbands_ids <- substr(basename(needbands_files), 1, 20)
 needbands_ids
 message(paste(length(needbands_ids), "masked images without bands added and without metadata issues"))
 message(paste(length(masked_layer_ids), "masked images without bands added and without metadata issues"))
-
 ```
 
 
 ```{r addbands_func_defn}
 masked_imgfile <- needbands_files[1]
-masked_imgfile <- masked_imgfiles[1]
+# masked_imgfile <- masked_imgfiles[1]
 
 save_allbands <- function(masked_imgfile){
   # read in original 4 bands
@@ -144,7 +172,7 @@ save_allbands <- function(masked_imgfile){
   imgID <- substr(basename(masked_imgfile), 1, 20)
   
   img_metadata_df <- readr::read_csv("/nfs/khondula-data/planetmethane/img_metadata_df.csv")
-imgs_metadata_issues <- img_metadata_df %>% 
+  imgs_metadata_issues <- img_metadata_df %>% 
   dplyr::filter(quality_category == "test" | cloud_cover > 0.1 | visible_clouds) %>% pull(imgID)
 
   if(!imgID %in% imgs_metadata_issues){
@@ -219,11 +247,14 @@ purrr::walk(needbands_files, ~save_allbands(masked_imgfile = .x))
 ```{r}
 library(rslurm)
 # masked_imgfiles[7]
+needbands_files_nfs <- gsub("data", "/nfs/khondula-data/planetmethane", 
+                            needbands_files)
 
-pars <- data.frame(masked_imgfile = needbands_files, stringsAsFactors = FALSE)
+pars <- data.frame(masked_imgfile = needbands_files_nfs, stringsAsFactors = FALSE)
 
 sjob4 <- rslurm::slurm_apply(save_allbands, pars, 
                             jobname = "addbands",
+                            pkgs = c("raster", "readr", "dplyr", "velox", "colorspace"),
                             slurm_options = list(partition = "sesync", 
                                                  time = "12:00:00"),
                             nodes = 8, 
@@ -237,10 +268,10 @@ print_job_status(sjob4)
 
 ```{r}
 length(list.files("data/imgs_for_analysis"))
-band_names <- c("b1_blue", "b2_green", "b3_red", "b4_NIR",
-                "NDVI", "NDWI", "HUE", "SAT", "VAL", "LUM", "CHROMA", "HUE2")
-r_stack_in <- raster::stack("data/imgs_for_analysis/20171004_155646_103f.tif")
-names(r_stack_in) <- band_names
+# band_names <- c("b1_blue", "b2_green", "b3_red", "b4_NIR",
+#                 "NDVI", "NDWI", "HUE", "SAT", "VAL", "LUM", "CHROMA", "HUE2")
+# r_stack_in <- raster::stack("data/imgs_for_analysis/20171004_155646_103f.tif")
+# names(r_stack_in) <- band_names
 # tabularaster::as_tibble(r_stack_in) %>%
 #   dplyr::filter(!is.na(cellvalue)) %>%
 #   head()
