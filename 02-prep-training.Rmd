@@ -234,6 +234,49 @@ nwi_cropAOI <- nwi_prj %>% st_crop(AOI_union)
 
 ```
 
+Training data 
+
+```{r}
+AOI <- st_read("data/polygons/AOI_union.shp") %>% st_transform(planet_crs)
+ww_areas_maskNWImvdeps <- raster::stack("data/ww_areas_maskNWImvdeps.tif")
+
+nwi_FPLAKE <- st_read(file.path(data_dir, "nwi", "HU8_02060005_Watershed", "HU8_02060005_Wetlands.shp")) %>% 
+                 dplyr::filter(WETLAND_TY %in% c("Freshwater Pond", "Lake")) %>%
+                 st_transform(planet_crs)
+nwi_FPLAKE_crop <- st_join(nwi_FPLAKE, AOI, left = FALSE)
+# nwi_FPLAKE_crop %>% st_write("/nfs/khondula-data/planetmethane/polygons/nwi_FPLAKE_cropAOI.shp")
+# plot(nwi_FPLAKE_crop$geometry)
+```
+
+```{r}
+# library(leaflet)
+# nwi_FPLAKE_crop %>%
+#   st_transform(4326) %>%
+#   leaflet() %>%
+#   addProviderTiles(providers$Esri.WorldImagery) %>%
+#   addRasterImage(ww_areas_maskNWImvdeps) %>%
+#   addPolygons(opacity = 1, fillColor = "white", color = "white", weight = 1, group = "nwi") %>%
+#   addLayersControl(overlayGroups = c("nwi"))
+```
+
+
+```{r}
+  r_train_upland <- ww_areas_maskNWImvdeps %>% rasterToPolygons(n = 16, dissolve = TRUE)
+  r_train_upland <- r_train_upland %>% st_as_sf() %>% 
+    st_transform(planet_crs) %>% dplyr::mutate(trainclass = "upland")
+  r_train_upland$trainid <- paste0("upland", 1:nrow(r_train_upland))
+  r_train_upland <- r_train_upland[,-1]
+
+  train_water <- nwi_FPLAKE_crop %>% st_transform(planet_crs) %>% dplyr::mutate(trainclass = "water")
+  train_water$trainid <- paste0("water", 1:nrow(train_water))
+  train_water <- train_water[,-c(1:6)]
+
+  training_polygons_sf <- rbind(r_train_upland, train_water)
+
+# training_polygons_sf %>% st_write("/nfs/khondula-data/planetmethane/polygons/training_polygons_v2.shp")
+```
+
+
 Take out farm ponds
 
 ```{r}

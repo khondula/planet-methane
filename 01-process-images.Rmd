@@ -76,7 +76,7 @@ imgIDs_to_mask_w_udms
 
 Apply UDM mask to vector you just created - IDs with UDMs that arent in udm_masked_imgs folder:
 
-```{r udm_func_defn, eval=FALSE}
+```{r udm_func_defn}
 # imgID <- imgIDs_to_mask_w_udms[1]
 
 apply_udm_mask <- function(imgID){
@@ -97,7 +97,7 @@ apply_udm_mask <- function(imgID){
 Run function locally 
 
 ```{r}
-apply_udm_mask(imgID = imgIDs_to_mask_w_udms[4])
+apply_udm_mask(imgID = imgIDs_to_mask_w_udms[1])
 # purrr::walk(imgIDs_to_mask_w_udms[], ~apply_udm_mask(.x))
 ```
 
