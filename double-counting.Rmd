@@ -42,48 +42,49 @@ Now for each cell index, need to assign it to a polygon ID_sp based on polygon t
 ```{r}
 my_cellindices <- rf_predicts_dc[['cellindex']]
 my_cellindx <- my_cellindices[1]
-mvdeps_overlaps <- rf_predicts %>% 
-  dplyr::filter(cellindex == my_cellindx) %>%
-  pull(ID_sp)
+# mvdeps_overlaps <- rf_predicts %>% 
+#   dplyr::filter(cellindex == my_cellindx) %>%
+#   pull(ID_sp)
 ```
 
 ```{r}
-masked_layer_files <- fs::dir_ls("data/imgs_for_analysis")
-masked_layer_files_nfs <- gsub("data", "/nfs/khondula-data/planetmethane", masked_layer_files)
-
-img_file <- rf_predicts_file %>%
-  basename() %>% 
-  substr(11, 30) %>%
-  grep(masked_layer_files_nfs, value = TRUE)
-
-# load in image and the overlapping polygons
-imgstack <- raster::stack(img_file)[[1]]
-mvdeps_sf <- st_read("/nfs/khondula-data/planetmethane/polygons/mvdeps_buff20_inNLCD.shp")
-mvdeps_sub <- mvdeps_sf %>%
-  dplyr::filter(dep_id %in% mvdeps_overlaps)
-mvdeps_centroids <- mvdeps_sub %>% sf::st_centroid()
-
-centroid_xys <- raster::extract(imgstack, mvdeps_centroids, cellnumbers = TRUE, df = TRUE) %>%
-  dplyr::pull(cells) %>%
-  purrr::map(~as.data.frame(raster::xyFromCell(imgstack, cell = .x))) %>% 
-  bind_rows() %>% 
-  mutate(dep_id = mvdeps_overlaps) 
-
-centroids_sf <- st_as_sf(centroid_xys, coords = c("x", "y"))
-mycell_sf <- raster::xyFromCell(imgstack, cell = my_cellindx) %>% st_point()
-
-mvdep_closest <- mvdeps_overlaps[which.min(st_distance(mycell_sf, centroids_sf))]
+# masked_layer_files <- fs::dir_ls("data/imgs_for_analysis")
+# masked_layer_files_nfs <- gsub("data", "/nfs/khondula-data/planetmethane", masked_layer_files)
+# 
+# img_file <- rf_predicts_file %>%
+#   basename() %>% 
+#   substr(11, 30) %>%
+#   grep(masked_layer_files_nfs, value = TRUE)
+# 
+# # load in image and the overlapping polygons
+# imgstack <- raster::stack(img_file)[[1]]
+# mvdeps_sf <- st_read("/nfs/khondula-data/planetmethane/polygons/mvdeps_buff20_inNLCD.shp")
+# mvdeps_sub <- mvdeps_sf %>%
+#   dplyr::filter(dep_id %in% mvdeps_overlaps)
+# mvdeps_centroids <- mvdeps_sub %>% sf::st_centroid()
+# 
+# centroid_xys <- raster::extract(imgstack, mvdeps_centroids, cellnumbers = TRUE, df = TRUE) %>%
+#   dplyr::pull(cells) %>%
+#   purrr::map(~as.data.frame(raster::xyFromCell(imgstack, cell = .x))) %>% 
+#   bind_rows() %>% 
+#   mutate(dep_id = mvdeps_overlaps) 
+# 
+# centroids_sf <- st_as_sf(centroid_xys, coords = c("x", "y"))
+# mycell_sf <- raster::xyFromCell(imgstack, cell = my_cellindx) %>% st_point()
+# 
+# mvdep_closest <- mvdeps_overlaps[which.min(st_distance(mycell_sf, centroids_sf))]
 ```
 
-Function to return id of closest mvdep given an image and cellindex
+Define Function to return id of closest mvdep given an image and cellindex
 
 ```{r}
-find_closest_mvdep <- function(rf_predicts_file, my_cellindx){
+find_doublcount_mvdeps <- function(rf_predicts_file, my_cellindx){
   masked_layer_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/imgs_for_analysis")
   img_file <- rf_predicts_file %>%
     basename() %>% 
     substr(11, 30) %>%
     grep(masked_layer_files, value = TRUE)
+  thisimgID <- img_file %>% basename() %>% tools::file_path_sans_ext()
   
   mvdeps_overlaps <- rf_predicts_file %>% 
     vroom::vroom(col_types = c("iddddddddddddlllcddcc")) %>%
@@ -108,17 +109,108 @@ find_closest_mvdep <- function(rf_predicts_file, my_cellindx){
 
   mvdep_closest <- mvdeps_overlaps[which.min(st_distance(mycell_sf, centroids_sf))]
   mvdep_dc <- mvdeps_overlaps[-which.min(st_distance(mycell_sf, centroids_sf))]
-  return(list(mvdep_dc))
+  return_df <- data.frame("cellindex" = my_cellindx, 
+                          "dep_id_dc" = as.character(mvdep_dc),
+                          "remove_dc" = TRUE,
+                          stringsAsFactors = FALSE)
+  # save results 
+  data_dir <- "/nfs/khondula-data/planetmethane"
+  dc_dir <- file.path(data_dir, "metadata", "double_count_cells", thisimgID)
+  if(!fs::dir_exists(dc_dir)){fs::dir_create(dc_dir)}
+
+  df_filename <- file.path(dc_dir, sprintf("%s.csv", my_cellindx))
+  readr::write_csv(return_df, df_filename)
 }
 ```
 
+Apply function
 ```{r}
-closest_mvdeps_rf1 <- purrr::map(my_cellindices[1:10],
-                                     ~find_closest_mvdep(rf_predicts_files[1], 
+
+dc_mvdeps_rf1 <- purrr::map_df(my_cellindices[1:10],
+                                     ~find_doublcount_mvdeps(rf_predicts_files[1], 
                                                          my_cellindx = .x))
+
 ```
 
-Then use the closest mvdeps vector to update rf_predicts file, new row to filter out the polygons that are double counts
+Figure out cell numbers for given image
+```{r}
+rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels")
+# rf_predicts_file <- rf_predicts_files[1]
+
+get_my_cellindices <- function(rf_predicts_file){
+  my_cellindices <- rf_predicts_file %>% 
+    vroom::vroom(col_types = c("iddddddddddddlllcddcc")) %>%
+    filter(mvdeps, ranger_predict == 'water') %>% 
+    group_by(cellindex, x, y) %>%
+    summarise(n_polygons = n()) %>% 
+    filter(n_polygons > 1) %>% 
+    pull(cellindex)
+  return(my_cellindices)
+}
+
+my_cellindices <- get_my_cellindices(rf_predicts_files[2])
+```
+
+Get parameters to run on cluster
+```{r}
+cell_inds <- purrr::map(rf_predicts_files, ~get_my_cellindices(.x))
+names(cell_inds) <- rf_predicts_files
+head(cell_inds)
+cell_inds[[1]] %>% as.data.frame() %>% rename(my_cellindx = 1) %>% head()
+# for each item in list, make into a data frame with columns for rf_predicts_file and my_cellindx
+pars <- purrr::map_df(cell_inds, ~as.data.frame(.x), .id = 'rf_predicts_file') %>% 
+  rename(my_cellindx = 2)
+
+```
+
+Run on cluster
+```{r}
+library(rslurm)
+
+# my_cellindices <- get_my_cellindices(rf_predicts_files[5])
+# pars <- data.frame("rf_predicts_file" = rep(rf_predicts_files[5], length(my_cellindices)),
+#                    "my_cellindx" = my_cellindices,
+#                    stringsAsFactors = FALSE)
+
+sjob11 <- rslurm::slurm_apply(find_doublcount_mvdeps, pars, 
+                            jobname = "dbbl_all",
+                            slurm_options = list(partition = "sesync"),
+                            nodes = 10,
+                            cpus_per_node = 8,
+                            submit = TRUE)
+rslurm::print_job_status(sjob11)
+```
+
+```{r}
+length(list.files('data/metadata/double_count_cells')) # should get up to 256 (based on RF files)
+```
+
+Once all the double counted cells for an image are run through the find doublecount mvdeps function, Then use the closest mvdeps data frame to update rf_predicts file, new row to filter out the polygons that are double counts
+
+
+```{r}
+# read in
+rf_predicts <- rf_predicts_file %>% 
+  vroom::vroom(col_types = c("iddddddddddddlllcddcc")) %>%
+  dplyr::select(cellindex, water_training, mvdeps, imgID, x, y, ID_sp, ranger_predict)
+```
+
+
+```{r}
+rf_predicts_update <- rf_predicts %>%
+  dplyr::left_join(dc_mvdeps_rf1, by = c("cellindex", "ID_sp" = "dep_id_dc")) %>%
+  dplyr::mutate(remove_dc = replace_na(remove_dc, FALSE))
+```
+
+FIN
+
+
+
+
+
+## Just counting the percentage of each image that is double counted 
+
+This turned out to be about 5% on average
 
 ```{r}
 rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels")

@@ -29,9 +29,9 @@ masked_layer_files_nfs <- gsub("data", "/nfs/khondula-data/planetmethane", maske
 
 
 ```{r}
-masked_layer_files <- fs::dir_ls("data/imgs_for_analysis")
-imgfile <- masked_layer_files[1]
-imgfile <- allbands_notextracted[2]
+# masked_layer_files <- fs::dir_ls("data/imgs_for_analysis")
+# imgfile <- masked_layer_files[1]
+# imgfile <- allbands_notextracted[2]
 
 extract_allbands <- function(imgfile){
   data_dir <- "/nfs/khondula-data/planetmethane"
@@ -106,16 +106,16 @@ head(img_extract_narm)
 ```
 
 ```{r}
-extract_allbands(imgfile = masked_layer_files[1])
+# extract_allbands(imgfile = masked_layer_files[1])
 ```
 
 ```{r}
-testdf <- readr::read_csv(fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract/")[2])
-head(testdf)
+# testdf <- readr::read_csv(fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract/")[2])
+# head(testdf)
 ```
 
 ```{r}
-masked_layer_files
+# masked_layer_files
 # extract_allbands(masked_layer_files[2])
 
 masked_layer_files <- fs::dir_ls("data/imgs_for_analysis")
@@ -134,8 +134,8 @@ message(paste(length(allbands_notextracted), "images with bands added but not ex
 ```
 
 ```{r}
-extract_allbands(allbands_notextracted[1])
-purrr::walk(masked_layer_files[1:20], ~extract_allbands(.x))
+extract_allbands(allbands_notextracted[7])
+purrr::walk(allbands_notextracted[1:9], ~extract_allbands(.x))
 purrr::walk(masked_layer_files[21:40], ~extract_allbands(.x))
 purrr::walk(masked_layer_files[41:60], ~extract_allbands(.x))
 purrr::walk(masked_layer_files[61:80], ~extract_allbands(.x))
@@ -153,7 +153,7 @@ pars <- data.frame(imgfile = allbands_notextracted_nfs,
 sjob5 <- rslurm::slurm_apply(extract_allbands, pars, 
                             jobname = "extract5", 
                             pkgs = c("tabularaster", "fasterize", "velox", "raster", "sf", "dplyr", "readr", "tidyr", "fs"),
-                            slurm_options = list(time = "12:00:00", partition = "sesync"),
+                            slurm_options = list(time = "24:00:00", partition = "sesync"),
                             nodes = 5, 
                             cpus_per_node = 4,
                             submit = TRUE)
@@ -186,7 +186,7 @@ Function to get cell number to mvdeps polygon IDs for each image
 ```{r}
 
 # imgID # mvdepsID # cellindex
-imgfile <- masked_layer_files[7]
+# imgfile <- masked_layer_files[7]
 # img_id <- "20171221_151120_1035" # good
 
 library(raster)
@@ -230,20 +230,23 @@ get_mvdeps_cellnos <- function(imgfile, my_dep_id = "07960"){
 ```
 
 ```{r}
-mvdeps_polygons_sf <- sf::st_read("data/polygons/mvdeps_buff20_inNLCD.shp")
-mvdep_ids <- mvdeps_polygons_sf$dep_id %>% as.character()
-purrr::walk(mvdep_ids[1:100], ~get_mvdeps_cellnos(imgfile = masked_layer_files[7], my_dep_id = .x))
-purrr::walk2(.x = rep(masked_layer_files[7], 100),
-             .y = mvdep_ids[1:100], ~get_mvdeps_cellnos(imgfile = .x, my_dep_id = .y))
-
-img_cellnos <- fs::dir_ls("data/metadata/mvdeps_cellnos2/20171006_155635_104e/") %>%
-  map_df(~readr::read_csv(.x, col_types = c("dd")), .id = "filename")
+# mvdeps_polygons_sf <- sf::st_read("data/polygons/mvdeps_buff20_inNLCD.shp")
+# mvdep_ids <- mvdeps_polygons_sf$dep_id %>% as.character()
+# purrr::walk(mvdep_ids[1:100], ~get_mvdeps_cellnos(imgfile = masked_layer_files[7], my_dep_id = .x))
+# purrr::walk2(.x = rep(masked_layer_files[7], 100),
+#              .y = mvdep_ids[1:100], ~get_mvdeps_cellnos(imgfile = .x, my_dep_id = .y))
+# 
+# img_cellnos <- fs::dir_ls("data/metadata/mvdeps_cellnos2/20171006_155635_104e/") %>%
+#   map_df(~readr::read_csv(.x, col_types = c("dd")), .id = "filename")
 ```
 
 Or run on cluster
 ```{r}
 library(rslurm)
-pars <- data.frame(imgfile = rep(masked_layer_files, each = length(mvdep_ids)),
+mvdeps_polygons_sf <- sf::st_read("data/polygons/mvdeps_buff20_inNLCD.shp")
+mvdep_ids <- mvdeps_polygons_sf$dep_id %>% as.character()
+
+pars <- data.frame(imgfile = rep(masked_layer_files_nfs, each = length(mvdep_ids)),
                    my_dep_id = rep(mvdep_ids, times = length(masked_layer_files)),
                    stringsAsFactors = FALSE)
 

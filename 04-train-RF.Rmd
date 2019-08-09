@@ -15,7 +15,7 @@ library(caret)
 library(raster)
 library(rasterVis)
 library(data.table)
-# library(tabularaster)
+library(tabularaster)
 library(readr)
 library(ggplot2)
 library(stringr)
@@ -27,6 +27,8 @@ library(e1071)
 data_dir <- "/nfs/khondula-data/planetmethane"
 
 ```
+
+# testing out using one image
 
 Read in data for an image
 ```{r}
@@ -144,6 +146,8 @@ img_extract_predicts %>% dplyr::filter(ID_sp %in% c("09829", "10097", "10162", "
 img_extract_predicts %>% pull(ID_sp) %>% sort() %>% unique()
 # confusionMatrix(water_rf_pred, as.factor(water_rf_pred$trainclass))
 ```
+
+# function to run for an image
 
 ```{r}
 training_ids <- substr(basename(fs::dir_ls("/nfs/khondula-data/planetmethane/results/masked-allbands-extract/")), 1, 20)
@@ -382,7 +386,7 @@ library(rslurm)
 # training_ids_running <- training_ids
 # new_imgs_forrf <- imgs_wo_rfmodels[imgs_wo_rfmodels %in% complete_cellnos_imgs]
 
-pars <- data.frame(img_id = imgs_wo_rfmodels[2:4], predict_new_vals = FALSE,
+pars <- data.frame(img_id = imgs_wo_rfmodels[], predict_new_vals = TRUE,
                      # training_ids,
                    stringsAsFactors = FALSE)
 

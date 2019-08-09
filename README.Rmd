@@ -33,11 +33,17 @@ Processing PlanetScope Surface Reflectance data to develop a daily time series a
 
 * AOI shapefile from **polygons/AOI_union.shp**
 * NLCD area with NWI and MVdeps masked, as raster from **ww_areas_maskNWImvdeps.tif**
-* NWI water class data (ponds and lakes) from within AOI, generated from **HU8_02060005_Wetlands.shp** filtered to ponds and lake, then cropped using AOI
+* NWI polygons in **HU8_02060005_Wetlands.shp**
 
 #### Steps
 
+* filter NWI to wetland type ponds and lake, then cropped using AOI
+
 #### Outputs
+
+* upland training class
+* water training class
+* **results/nwi_inNLCD.csv** ?
 
 ## 03-extract-vals
 
@@ -49,30 +55,75 @@ Processing PlanetScope Surface Reflectance data to develop a daily time series a
 
 #### Steps
 
-`extract_allbands` function - 
+`extract_allbands` function
 
 * reads in image file, training polygons, and topographic depressions
 * make data frame of all values with cell ids using `tabularaster::as_tibble`
 * extract values with polygon IDs using `velox`
 
+`get_mvdeps_cellnos` function
+
+* filters topographic depressions to a single polygon to use in query argument for `tabularatser::cellnumbers`, saves a separate csv file for each polygon in a folder for that image. 
+
 #### Outputs
 
 * in **results/masked-allbands-extract_spIDs**
 * in **results/masked-allbands-extract_cellids**
+* in **metadata/mvdeps_cellnos2/%imgID%/** - csv files for each depression with cellnumbers
 
 ## 04-train-RF
 
 #### Inputs
 
+* **results/masked-allbands-extract_spIDs**: training data for model, extracted in previous step
+* **results/nwi_inNLCD.csv**
+* **metadata/mvdeps_cellnos** - cell numbers for each polygon grouping
+
 #### Steps
 
+`run_rf_for_imgid`
+
+* uses `img_id` argument to get appropriate file of training data, reads in using `data.table::fread`
+* remove from training data: HUE, HUE2, VAL, upland5 (emergent herbaceous)
+* filters training data to just polygons that are in NLCD categories of interest
+* selects 2/3 of water data and an equal size selection of upland data, filters out any NAs
+* parameter grid developed (mtry, splitrule, min.node.size)
+* train using ranger with tuning grid, 1000 trees, save importance as permutation
+* `if(predict_new_vals == TRUE)`, predictions for all mvdeps is done in this function (steps described below)
+
+`predict_rf_for_img` - if there is a model to apply to image values
+
+* mvdeps band data for given image ID read in from **masked-allbands-extract_cellids** folder using `data.table::fread`, and cell numbers from **metadata/mvdeps_cellnos** folder. In the cellnos file, ID_sp need to be left padded apparently. 
+* These two files are joined into `img_extract_narm` and then used in `predict` with the RF model. 
+* Predictions are added as a column to `img_extract_narm` and this data is saved in **results/rf_predicts_noEHW_pixels** folder.
+* Then it is grouped by polygon and water/upland as `img_extract_predicts`, which is saved in **results/rf_predicts_noEHW**. 
+
 #### Outputs
+
+* **results/rf_meta/noEHW_v2** - not sure what this is
+* **results/rf_model_files/noEHW_v2** - each model file (as %imgid%.rds) in this directory
+* **results/rf_predicts_noEHW_pixels** - every cell predicted
+* **results/rf_predicts_noEHW** - polygon level predictions for number of water and upland cells. 
+
+## double-counting
+
+*in progress*
+
+* updates rf_predicts files with a column to filter out the predicted water cells that occur in more than one polygon. 
+* cellindex and polygon IDs for the double counted cells to be filtered out are in **metadata/double_count_cells/%img_id%** with one file for each cell. 
+* once all the cells for a given image are done, combine and then use to update rf predicts, save new files
+
 
 ## 05-daily-time-series
 
 #### Inputs
 
+* rf predictions in **results/rf_predicts_noEHW_v2**
+* areas of topographic depressions in **metadata/mvdeps_buffered_area.csv**
+
 #### Steps
+
+* reads in rf predictions into one data frame
 
 #### Outputs
 
