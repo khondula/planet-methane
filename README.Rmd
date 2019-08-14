@@ -7,7 +7,7 @@ output:
     keep_md: true
 ---
 
-Processing PlanetScope Surface Reflectance data to develop a daily time series and then applying a methane model
+Processing PlanetScope Surface Reflectance data to develop a daily time series of surface water extent, for applying an empirical methane model
 
 ## 01-process-images
 

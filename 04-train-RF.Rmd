@@ -187,7 +187,7 @@ run_rf_for_imgid <- function(img_id, predict_new_vals = FALSE){
     meta_files_dir <- file.path(data_dir, "results/rf_meta/noEHW_v2")
     if(!fs::dir_exists(meta_files_dir)){fs::dir_create(meta_files_dir)}
   meta_filename <- file.path(meta_files_dir, sprintf("%s.rds", thisimgID))
-  readr::write_csv(rf_meta, meta_filename)
+  readr::write_csv(rf_meta, meta_filename) ########## write csv for .rds??? ###
   
   if(train_water_nrow > 0){
     
@@ -386,7 +386,7 @@ library(rslurm)
 # training_ids_running <- training_ids
 # new_imgs_forrf <- imgs_wo_rfmodels[imgs_wo_rfmodels %in% complete_cellnos_imgs]
 
-pars <- data.frame(img_id = imgs_wo_rfmodels[], predict_new_vals = TRUE,
+pars <- data.frame(img_id = imgs_wo_rfmodels[], predict_new_vals = FALSE,
                      # training_ids,
                    stringsAsFactors = FALSE)
 
@@ -394,13 +394,13 @@ sjobrf6 <- rslurm::slurm_apply(run_rf_for_imgid,
                                pars, 
                             jobname = "rf6", 
                             slurm_options = list(partition = "sesync"),
-                            nodes = 3,
-                            # cpus_per_node = 1,
+                            nodes = 5,
+                            cpus_per_node = 8,
                             submit = TRUE)
 
-rslurm::print_job_status(sjobrf5)
+# rslurm::print_job_status(sjobrf5)
 rslurm::print_job_status(sjobrf6)
-rslurm::print_job_status(sjobrf4)
+# rslurm::print_job_status(sjobrf4)
 length(list.files("/nfs/khondula-data/planetmethane/results/rf_model_files/noEHW_v2"))
 # 
 # rslurm::cancel_slurm(sjobrf4)
@@ -409,10 +409,10 @@ length(list.files("/nfs/khondula-data/planetmethane/results/rf_model_files/noEHW
 # RF PREDICTIONS
 
 ```{r}
-thisimgID <- "20171228_154351_0f3d" # was bad
-thisimgID <- "20180618_151353_1024" # completed cellnos extract
-thisimgID <- "20171006_155634_104e"
-thisimgID <- imgs_wo_rfmodels[1]
+# thisimgID <- "20171228_154351_0f3d" # was bad
+# thisimgID <- "20180618_151353_1024" # completed cellnos extract
+# thisimgID <- "20171006_155634_104e"
+# thisimgID <- imgs_wo_rfmodels[1]
 library(fs)
 library(data.table)
 library(readr)
@@ -426,7 +426,7 @@ predict_rf_for_img <- function(thisimgID){
   data_dir <- "/nfs/khondula-data/planetmethane"
 
   img_id <- thisimgID
-  model_files_dir <- file.path(data_dir, "results/rf_model_files/noEHW")
+  model_files_dir <- file.path(data_dir, "results/rf_model_files/noEHW_v2")
   model_filename <- file.path(model_files_dir, sprintf("%s.rds", thisimgID))
   rf1 <- readRDS(file = model_filename)
 
@@ -498,6 +498,12 @@ imgs_wrf_predicts <- substr(basename(fs::dir_ls("/nfs/khondula-data/planetmethan
 
 imgs_for_rf <- imgs_w_rfmodels[!imgs_w_rfmodels %in% imgs_wrf_predicts]
 message(paste(length(imgs_for_rf), "images with RF trained but not predicted"))
+```
+
+```{r}
+predict_rf_for_img(thisimgID = imgs_for_rf[1])
+purrr::walk(imgs_for_rf[2:41], ~predict_rf_for_img(.x))
+
 ```
 
 ```{r}

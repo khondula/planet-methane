@@ -134,7 +134,7 @@ dc_mvdeps_rf1 <- purrr::map_df(my_cellindices[1:10],
 
 Figure out cell numbers for given image
 ```{r}
-rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels")
+rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels_v2")
 # rf_predicts_file <- rf_predicts_files[1]
 
 get_my_cellindices <- function(rf_predicts_file){
@@ -151,16 +151,22 @@ get_my_cellindices <- function(rf_predicts_file){
 my_cellindices <- get_my_cellindices(rf_predicts_files[2])
 ```
 
+```{r}
+rf_predicts_ids <- substr(basename(rf_predicts_files), 11, 30)
+dbbl_count_ids <- list.files('data/metadata/double_count_cells')
+need_dbbl_count_ids <- rf_predicts_files[!rf_predicts_ids %in% dbbl_count_ids]
+```
+
 Get parameters to run on cluster
 ```{r}
-cell_inds <- purrr::map(rf_predicts_files, ~get_my_cellindices(.x))
-names(cell_inds) <- rf_predicts_files
+cell_inds <- purrr::map(need_dbbl_count_ids, ~get_my_cellindices(.x))
+names(cell_inds) <- need_dbbl_count_ids
 head(cell_inds)
 cell_inds[[1]] %>% as.data.frame() %>% rename(my_cellindx = 1) %>% head()
 # for each item in list, make into a data frame with columns for rf_predicts_file and my_cellindx
 pars <- purrr::map_df(cell_inds, ~as.data.frame(.x), .id = 'rf_predicts_file') %>% 
   rename(my_cellindx = 2)
-
+head(pars)
 ```
 
 Run on cluster
@@ -173,10 +179,10 @@ library(rslurm)
 #                    stringsAsFactors = FALSE)
 
 sjob11 <- rslurm::slurm_apply(find_doublcount_mvdeps, pars, 
-                            jobname = "dbbl_all",
+                            jobname = "dbbl_all2",
                             slurm_options = list(partition = "sesync"),
-                            nodes = 10,
-                            cpus_per_node = 8,
+                            nodes = 16,
+                            cpus_per_node = 2,
                             submit = TRUE)
 rslurm::print_job_status(sjob11)
 ```
@@ -184,6 +190,7 @@ rslurm::print_job_status(sjob11)
 ```{r}
 length(list.files('data/metadata/double_count_cells')) # should get up to 256 (based on RF files)
 ```
+
 
 Once all the double counted cells for an image are run through the find doublecount mvdeps function, Then use the closest mvdeps data frame to update rf_predicts file, new row to filter out the polygons that are double counts
 
@@ -203,81 +210,3 @@ rf_predicts_update <- rf_predicts %>%
 ```
 
 FIN
-
-
-
-
-
-## Just counting the percentage of each image that is double counted 
-
-This turned out to be about 5% on average
-
-```{r}
-rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels")
-
-calc_double_count_percentage <- function(rf_predicts_file){
-  
-rf_predicts <- rf_predicts_file %>% 
-  vroom::vroom(col_types = c("iddddddddddddlllcddcc")) %>%
-  dplyr::select(cellindex, water_training, mvdeps, imgID, x, y, ID_sp, ranger_predict)
-
-rf_predicts_dc <- rf_predicts %>% 
-  filter(mvdeps, ranger_predict == 'water') %>% 
-  group_by(cellindex) %>%
-  summarise(n_polygons = n()) %>% 
-  arrange(desc(n_polygons)) %>% filter(n_polygons > 1)
-
-water_pix <- rf_predicts %>% filter(mvdeps, ranger_predict == 'water') %>% nrow()
-water_pix_dc <- rf_predicts_dc %>% nrow()
-
-percentage_dc <- water_pix_dc/water_pix
-
-# actually should calculate both the absoluate number (area) and percentage
-return(list("water_pix" = water_pix,
-            "water_pix_dc" = water_pix_dc, 
-            "dc_percentage" = percentage_dc))
-}
-
-calc_double_count_percentage('/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels/rfpredict_20180708_151405_104e.csv')
-
-dc_percentages <- purrr::map(rf_predicts_files, ~calc_double_count_percentage(.x))
-
-dc_percentages_df <- data.table::rbindlist(dc_percentages, fill = TRUE, idcol = TRUE) %>%
-  as.data.frame()
-
-dc_percentages_df %>% 
-  mutate(imgID = substr(basename(.id), 11, 30)) %>%
-  mutate(imgDate = as.Date(substr(imgID, 1, 8), "%Y%m%d")) %>%
-  dplyr::select(-.id) %>%
-  ggplot(aes(x = imgDate, y = dc_percentage)) +
-  geom_point() + theme_bw()
-
-dc_percentages_df %>% 
-  mutate(imgID = substr(basename(.id), 11, 30)) %>%
-  mutate(imgDate = as.Date(substr(imgID, 1, 8), "%Y%m%d")) %>%
-  dplyr::select(-.id) %>%
-  ggplot(aes(x = imgDate, y = water_pix_dc)) +
-  geom_point() + theme_bw()
-
-dc_percentages %>% as.data.frame() %>% tibble::rownames_to_column() %>%
-  # pull(.) %>% summary()
-  ggplot(aes(x = .)) + geom_histogram(binwidth = .01)
-  View()
-# rf_predicts_dc %>% left_join(rf_predicts) %>% pull(ID_sp) %>% unique() %>% length()
-# rf_predicts_dc
-dc_percentages_df$dc_percentage %>% summary()
-dc_percentages_df$water_pix_dc %>% summary()*9/1e6
-```
-
-```{r}
-rf_predicts_dc$n_polygons %>% table()
-```
-
-Area associated with the polygons that are removed from analysis (approx 300 polygons)
-
-```{r}
-mydep_ids <- substr(list.files(file.path(data_dir, "results", "ch4_flux_predicts")), 8, 12)
-mvdeps_buffered_areas %>%
-  filter(!dep_id %in% mydep_ids) %>% summarise(sum_area_excluded = sum(area_m2)/1e6)
-```
-
