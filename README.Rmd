@@ -21,7 +21,16 @@ Processing PlanetScope Surface Reflectance data to develop a daily time series o
 * applies UDM to images with function `apply_udm_mask`, these intermediate files saved in **udm_masked_imgs**
 * calculates new layers: NDVI, NDWI, Hue, Saturation, Value, Chroma, Lum, Hue2
 
-*add in table with metrics, definition, function/package*
+| layer      | definition |
+|------------|----------- |
+| NDVI       | (NIR - Red)/(NIR + Red) |
+| NDWI       | (Green - NIR)/(Green + NIR)
+| Hue        | rgb2hsv h |
+| Saturation | rgb2hsv s |
+| Value      | rgb2hsv v |
+| Chroma     | colorspace::RGB %>% as("polarLAB") L |
+| Lum        | colorspace::RGB %>% as("polarLAB") C |
+| Hue2       | colorspace::RGB %>% as("polarLAB") H |
 
 #### Outputs
 
