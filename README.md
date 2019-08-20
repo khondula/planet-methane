@@ -7,7 +7,7 @@ output:
     keep_md: true
 ---
 
-Processing PlanetScope Surface Reflectance data to develop a daily time series and then applying a methane model
+Processing PlanetScope Surface Reflectance data to develop a daily time series of surface water extent, for applying an empirical methane model
 
 ## 01-process-images
 
@@ -102,16 +102,30 @@ Processing PlanetScope Surface Reflectance data to develop a daily time series a
 
 * **results/rf_meta/noEHW_v2** - not sure what this is
 * **results/rf_model_files/noEHW_v2** - each model file (as %imgid%.rds) in this directory
-* **results/rf_predicts_noEHW_pixels** - every cell predicted
+* **results/rf_predicts_noEHW_pixels_v2** - every cell predicted
 * **results/rf_predicts_noEHW** - polygon level predictions for number of water and upland cells. 
 
 ## double-counting
 
-*in progress*
+### Inputs
+
+* **results/rf_predicts_noEHW_pixels**
+* **imgs_for_analysis**
+* **polygons/mvdeps_buff20_inNLCD.shp**
+
+### Steps
+
+* funciton `find_doublcount_mvdeps` return id of closest mvdep given an image and cellindex
+* saves results (one file per image and cell index) in **metadata/double_count_cells**
+* function `get_my_cellindices` helps construct parameter data frame for slurm submission
 
 * updates rf_predicts files with a column to filter out the predicted water cells that occur in more than one polygon. 
 * cellindex and polygon IDs for the double counted cells to be filtered out are in **metadata/double_count_cells/%img_id%** with one file for each cell. 
 * once all the cells for a given image are done, combine and then use to update rf predicts, save new files
+
+### Outputs
+
+* **results/rf_predicts_wdc** - file for each image that is the same as **results/rf_predicts_noEHW_pixels_v2** except with an extra column called **remove_dc** for water cells that are being double counted 
 
 
 ## 05-daily-time-series
