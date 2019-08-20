@@ -134,7 +134,7 @@ dc_mvdeps_rf1 <- purrr::map_df(my_cellindices[1:10],
 
 Figure out cell numbers for given image
 ```{r}
-rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels_v2")
+# rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels_v2")
 # rf_predicts_file <- rf_predicts_files[1]
 
 get_my_cellindices <- function(rf_predicts_file){
@@ -148,10 +148,11 @@ get_my_cellindices <- function(rf_predicts_file){
   return(my_cellindices)
 }
 
-my_cellindices <- get_my_cellindices(rf_predicts_files[2])
+# my_cellindices <- get_my_cellindices(rf_predicts_files[2])
 ```
 
 ```{r}
+rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels_v2")
 rf_predicts_ids <- substr(basename(rf_predicts_files), 11, 30)
 dbbl_count_ids <- list.files('data/metadata/double_count_cells')
 need_dbbl_count_ids <- rf_predicts_files[!rf_predicts_ids %in% dbbl_count_ids]
@@ -159,6 +160,7 @@ need_dbbl_count_ids <- rf_predicts_files[!rf_predicts_ids %in% dbbl_count_ids]
 
 Get parameters to run on cluster
 ```{r}
+library(dplyr)
 cell_inds <- purrr::map(need_dbbl_count_ids, ~get_my_cellindices(.x))
 names(cell_inds) <- need_dbbl_count_ids
 head(cell_inds)
@@ -172,41 +174,77 @@ head(pars)
 Run on cluster
 ```{r}
 library(rslurm)
-
+# dont forget to load libraries!
 # my_cellindices <- get_my_cellindices(rf_predicts_files[5])
 # pars <- data.frame("rf_predicts_file" = rep(rf_predicts_files[5], length(my_cellindices)),
 #                    "my_cellindx" = my_cellindices,
 #                    stringsAsFactors = FALSE)
 
-sjob11 <- rslurm::slurm_apply(find_doublcount_mvdeps, pars, 
-                            jobname = "dbbl_all2",
+sjob12 <- rslurm::slurm_apply(find_doublcount_mvdeps, pars, 
+                            jobname = "dbbl_6",
                             slurm_options = list(partition = "sesync"),
-                            nodes = 16,
+                            nodes = 12,
                             cpus_per_node = 2,
                             submit = TRUE)
-rslurm::print_job_status(sjob11)
+rslurm::print_job_status(sjob12)
 ```
 
 ```{r}
-length(list.files('data/metadata/double_count_cells')) # should get up to 256 (based on RF files)
+length(list.files('data/metadata/double_count_cells')) # should get up to 297 (based on RF files)
 ```
 
+
+## Update rf_predicts files
 
 Once all the double counted cells for an image are run through the find doublecount mvdeps function, Then use the closest mvdeps data frame to update rf_predicts file, new row to filter out the polygons that are double counts
 
 
 ```{r}
-# read in
-rf_predicts <- rf_predicts_file %>% 
-  vroom::vroom(col_types = c("iddddddddddddlllcddcc")) %>%
-  dplyr::select(cellindex, water_training, mvdeps, imgID, x, y, ID_sp, ranger_predict)
+rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels_v2")
+rf_predicts_ids <- substr(basename(rf_predicts_files), 11, 30)
+rf_predicts_id <- rf_predicts_ids[1]
 ```
 
-
 ```{r}
-rf_predicts_update <- rf_predicts %>%
-  dplyr::left_join(dc_mvdeps_rf1, by = c("cellindex", "ID_sp" = "dep_id_dc")) %>%
-  dplyr::mutate(remove_dc = replace_na(remove_dc, FALSE))
+save_rf_updates <- function(rf_predicts_id){
+  rf_predicts_files <- fs::dir_ls("/nfs/khondula-data/planetmethane/results/rf_predicts_noEHW_pixels_v2")
+  dc_dirs <- fs::dir_ls("/nfs/khondula-data/planetmethane/metadata/double_count_cells/")
+  
+  rf_predicts_file <- rf_predicts_files[grep(rf_predicts_id, rf_predicts_files)]
+  dc_dir <- dc_dirs[grep(rf_predicts_id, dc_dirs)]
+  # read in rf_predicts data
+  rf_predicts <- rf_predicts_file %>% 
+    vroom::vroom(col_types = c("iddddddddddddlllcddcc")) %>%
+    dplyr::select(cellindex, water_training, mvdeps, imgID, x, y, ID_sp, ranger_predict)
+  # read in double count data
+  dc_files <- fs::dir_ls(dc_dir)
+  dc_mvdeps_rf1 <- purrr::map_df(dc_files, ~readr::read_csv(.x, col_types = c("icl")))
+  # merge
+  rf_predicts_update <- rf_predicts %>%
+    dplyr::left_join(dc_mvdeps_rf1, by = c("cellindex", "ID_sp" = "dep_id_dc")) %>%
+    dplyr::mutate(remove_dc = tidyr::replace_na(remove_dc, FALSE))
+  # save updated data
+  data_dir <- "/nfs/khondula-data/planetmethane"
+  df_filename <- file.path(data_dir, "results", "rf_predicts_wdc", sprintf("%s.csv", rf_predicts_id))
+  readr::write_csv(rf_predicts_update, df_filename)
+}
+```
+
+Run on cluster
+```{r}
+library(rslurm)
+# dont forget to load libraries!
+rf_predicts_ids <- basename(list.files('data/metadata/double_count_cells'))
+pars <- data.frame("rf_predicts_id" = rf_predicts_ids,
+                   stringsAsFactors = FALSE)
+
+sjob12 <- rslurm::slurm_apply(save_rf_updates, pars, 
+                            jobname = "dcupdates",
+                            slurm_options = list(partition = "sesync"),
+                            nodes = 12,
+                            cpus_per_node = 2,
+                            submit = TRUE)
+rslurm::print_job_status(sjob12)
 ```
 
 FIN
